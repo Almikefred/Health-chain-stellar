@@ -11,8 +11,9 @@ use soroban_sdk::{
 };
 
 use super::{
-    BloodRequest, BloodStatus, BloodType, BloodUnit, CoordinatorContract, CoordinatorContractClient,
-    CoordinatorError, Payment, PaymentStatus, RequestStatus, WorkflowStatus,
+    BloodRequest, BloodStatus, BloodType, BloodUnit, CoordinatorContract,
+    CoordinatorContractClient, CoordinatorError, Payment, PaymentStatus, RequestStatus,
+    WorkflowStatus,
 };
 
 // ── Mock: Request contract ────────────────────────────────────────────────────
@@ -165,7 +166,7 @@ impl MockPaymentContract {
             .unwrap()
     }
 
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) {
+    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus, _caller: Address) {
         let mut p: Payment = env
             .storage()
             .persistent()
@@ -182,6 +183,7 @@ impl MockPaymentContract {
         payment_id: u64,
         _reason: super::payment_client::DisputeReason,
         _case_id: String,
+        _caller: Address,
     ) {
         let mut p: Payment = env
             .storage()
@@ -619,7 +621,10 @@ fn test_allocate_units_rejects_empty_unit_ids() {
     );
 
     let wf = h.coord.try_get_workflow(&1u64);
-    assert!(wf.is_err(), "Workflow should not exist after rejected allocation");
+    assert!(
+        wf.is_err(),
+        "Workflow should not exist after rejected allocation"
+    );
 }
 
 // ── Issue #1310: Payment/request binding ──────────────────────────────────────
@@ -648,7 +653,10 @@ fn test_allocate_units_rejects_mismatched_payment() {
     );
 
     let wf = h.coord.try_get_workflow(&1u64);
-    assert!(wf.is_err(), "Workflow should not exist after rejected binding");
+    assert!(
+        wf.is_err(),
+        "Workflow should not exist after rejected binding"
+    );
 }
 
 #[test]
@@ -658,7 +666,7 @@ fn test_settle_payment_verifies_binding() {
     seed_pending_request(&h, 2);
     let unit_id = register_unit(&h);
     // Create payment escrowed for request 2
-    let payment_id_for_req2 = create_locked_payment(&h, 2);
+    let _payment_id_for_req2 = create_locked_payment(&h, 2);
 
     // Create a valid workflow for request 1 with a payment for request 1
     let payment_id_for_req1 = create_locked_payment(&h, 1);
@@ -669,7 +677,8 @@ fn test_settle_payment_verifies_binding() {
         &h.admin,
         &BloodType::OPositive,
     );
-    h.coord.confirm_delivery(&1u64, &h.admin, &String::from_str(&h.env, "Location-A"));
+    h.coord
+        .confirm_delivery(&1u64, &h.admin, &String::from_str(&h.env, "Location-A"));
 
     // Manually corrupt the workflow to use the mismatched payment (for testing purposes only)
     // We create a new workflow for request 1 but reference payment from request 2
@@ -685,10 +694,10 @@ fn test_rollback_verifies_binding() {
     seed_pending_request(&h, 1);
     seed_pending_request(&h, 2);
     let unit_id1 = register_unit(&h);
-    let unit_id2 = register_unit(&h);
+    let _unit_id2 = register_unit(&h);
 
     // Create payment for request 2
-    let payment_id_for_req2 = create_locked_payment(&h, 2);
+    let _payment_id_for_req2 = create_locked_payment(&h, 2);
     // Allocate request 1 with payment for request 1
     let payment_id_for_req1 = create_locked_payment(&h, 1);
     h.coord.allocate_units(
@@ -705,7 +714,8 @@ fn test_rollback_verifies_binding() {
     h.coord.rollback(&1u64);
     let wf = h.coord.get_workflow(&1u64);
     assert_eq!(wf.status, WorkflowStatus::RolledBack);
-    let payment = MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&payment_id_for_req1);
+    let payment =
+        MockPaymentContractClient::new(&h.env, &h.pay_id).get_payment(&payment_id_for_req1);
     assert_eq!(payment.status, PaymentStatus::Refunded);
 }
 
@@ -1056,11 +1066,8 @@ fn test_emergency_halt_blocks_settle_operations() {
         &BloodType::OPositive,
     );
 
-    h.coord.confirm_delivery(
-        &1u64,
-        &h.admin,
-        &String::from_str(&h.env, "Hospital-A-GPS"),
-    );
+    h.coord
+        .confirm_delivery(&1u64, &h.admin, &String::from_str(&h.env, "Hospital-A-GPS"));
 
     h.coord.emergency_halt(&h.admin);
     assert!(h.coord.is_emergency_halted());
@@ -1096,11 +1103,8 @@ fn test_clear_emergency_halt_restores_operation() {
         &BloodType::OPositive,
     );
 
-    h.coord.confirm_delivery(
-        &1u64,
-        &h.admin,
-        &String::from_str(&h.env, "Hospital-A-GPS"),
-    );
+    h.coord
+        .confirm_delivery(&1u64, &h.admin, &String::from_str(&h.env, "Hospital-A-GPS"));
 
     h.coord.emergency_halt(&h.admin);
     assert!(h.coord.is_emergency_halted());
@@ -1145,13 +1149,13 @@ fn test_rollback_blocked_after_delivery() {
         &BloodType::OPositive,
     );
 
-    h.coord.confirm_delivery(
-        &1u64,
-        &h.admin,
-        &String::from_str(&h.env, "Hospital-A-GPS"),
-    );
+    h.coord
+        .confirm_delivery(&1u64, &h.admin, &String::from_str(&h.env, "Hospital-A-GPS"));
 
-    assert_eq!(h.coord.get_workflow(&1u64).status, WorkflowStatus::Delivered);
+    assert_eq!(
+        h.coord.get_workflow(&1u64).status,
+        WorkflowStatus::Delivered
+    );
 
     let result = h.coord.try_rollback(&1u64);
     assert_eq!(result, Err(Ok(CoordinatorError::InvalidWorkflowState)));
@@ -1375,10 +1379,7 @@ fn test_allocate_units_allows_reallocation_after_settled() {
         .confirm_delivery(&9u64, &h.admin, &String::from_str(&h.env, "Hospital-C"));
     h.coord.settle_payment(&9u64, &h.admin);
 
-    assert_eq!(
-        h.coord.get_workflow(&9u64).status,
-        WorkflowStatus::Settled
-    );
+    assert_eq!(h.coord.get_workflow(&9u64).status, WorkflowStatus::Settled);
 
     // Attempt to allocate again for the same request
     seed_pending_request(&h, 9); // Restore request to Pending
@@ -1402,4 +1403,61 @@ fn test_allocate_units_allows_reallocation_after_settled() {
     let wf = h.coord.get_workflow(&9u64);
     assert_eq!(wf.status, WorkflowStatus::Allocated);
     assert_eq!(wf.payment_id, payment_id2);
+}
+
+// ── #1446 / #1448 regressions ─────────────────────────────────────────────────
+
+/// #1446: rollback is whitelisted to Allocated, so a second rollback cannot
+/// release units again (they may already belong to another workflow).
+#[test]
+fn test_rollback_rejects_already_rolled_back_workflow() {
+    let h = setup();
+    seed_pending_request(&h, 1);
+    let unit_id = register_unit(&h);
+    let payment_id = create_locked_payment(&h, 1);
+    h.coord.allocate_units(
+        &1u64,
+        &vec![&h.env, unit_id],
+        &payment_id,
+        &h.admin,
+        &BloodType::OPositive,
+    );
+    h.coord.rollback(&1u64);
+
+    // The unit is re-reserved by someone else after the rollback.
+    MockInventoryContractClient::new(&h.env, &h.inv_id).update_status(
+        &unit_id,
+        &BloodStatus::Reserved,
+        &h.admin,
+        &None,
+    );
+
+    let result = h.coord.try_rollback(&1u64);
+    assert_eq!(result, Err(Ok(CoordinatorError::InvalidWorkflowState)));
+    let unit = MockInventoryContractClient::new(&h.env, &h.inv_id).get_blood_unit(&unit_id);
+    assert_eq!(unit.status, BloodStatus::Reserved);
+}
+
+/// #1448: the request contract also reports InProgress and Rejected; the
+/// coordinator must decode them (instead of trapping) and refuse to allocate.
+#[test]
+fn test_allocate_rejects_in_progress_and_rejected_requests() {
+    let h = setup();
+    let req = MockRequestContractClient::new(&h.env, &h.req_id);
+    for (id, status) in [
+        (1u64, RequestStatus::InProgress),
+        (2u64, RequestStatus::Rejected),
+    ] {
+        req.seed_request(&id, &status);
+        let unit_id = register_unit(&h);
+        let payment_id = create_locked_payment(&h, id);
+        let result = h.coord.try_allocate_units(
+            &id,
+            &vec![&h.env, unit_id],
+            &payment_id,
+            &h.admin,
+            &BloodType::OPositive,
+        );
+        assert_eq!(result, Err(Ok(CoordinatorError::InvalidRequestState)));
+    }
 }
