@@ -54,7 +54,7 @@ All critical actions are enforced by smart contracts, reducing fraud and manual 
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| Node.js | >= 18.x | Backend and frontend runtime |
+| Node.js | >= 20.x | Backend and frontend runtime |
 | Docker + Docker Compose | latest | PostgreSQL (:5432) and Redis (:6379) |
 | Rust + Cargo | stable | Soroban smart contracts |
 | Stellar CLI (`stellar`) | >= 21.x | Deploy and invoke contracts |
@@ -69,6 +69,7 @@ docker-compose up -d
 cd backend
 cp .env.example .env   # edit DATABASE_PASSWORD, JWT_SECRET at minimum
 npm install
+npm run build
 npm run migration:run
 npm run start:dev      # http://localhost:3001 — Swagger UI at /docs
 ```
@@ -91,6 +92,7 @@ For contract deployment, full environment variable reference, and contributor gu
 | Swagger UI | `:3001/docs` |
 | PostgreSQL | `:5432` |
 | Redis | `:6379` |
+| Bull Board (optional tools profile) | `:3002` |
 
 ## Project Structure
 
