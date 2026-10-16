@@ -28,7 +28,8 @@ mod security_tests {
         fn initialize(&self, _env: Env, admin: Address) -> Result<(), ContractError> {
             self.client
                 .try_initialize(&admin)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn authorize_bank(
@@ -40,7 +41,8 @@ mod security_tests {
         ) -> Result<(), ContractError> {
             self.client
                 .try_authorize_bank(&admin, &bank, &authorized)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn register_blood(
@@ -60,7 +62,8 @@ mod security_tests {
                     &quantity_ml,
                     &donor_id,
                 )
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn reserve_blood(
@@ -73,7 +76,8 @@ mod security_tests {
         ) -> Result<u64, ContractError> {
             self.client
                 .try_reserve_blood(&requester, &unit_ids, &request_id, &duration_seconds)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn batch_reserve_blood(
@@ -84,7 +88,8 @@ mod security_tests {
         ) -> Result<soroban_sdk::Vec<u64>, ContractError> {
             self.client
                 .try_batch_reserve_blood(&requester, &batch)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn get_reservation(
@@ -94,7 +99,8 @@ mod security_tests {
         ) -> Result<Reservation, ContractError> {
             self.client
                 .try_get_reservation(&reservation_id)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn release_reservation_by_contract(
@@ -105,7 +111,8 @@ mod security_tests {
         ) -> Result<(), ContractError> {
             self.client
                 .try_release_reservation_by_contract(&authorized_contract, &reservation_id)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn grant_role(
@@ -117,7 +124,8 @@ mod security_tests {
         ) -> Result<(), ContractError> {
             self.client
                 .try_grant_role(&admin, &grantee, &role)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
 
         fn update_status(
@@ -130,7 +138,8 @@ mod security_tests {
         ) -> Result<BloodUnit, ContractError> {
             self.client
                 .try_update_status(&unit_id, &new_status, &authorized_by, &reason)
-                .map_err(|contract_result| contract_result.unwrap())
+                .map(|r| r.unwrap())
+                .map_err(|e| e.unwrap())
         }
     }
 
@@ -448,7 +457,7 @@ mod security_tests {
 
         // Verify reservation was released.
         // Reservation does not implement PartialEq, so use unwrap_err() (issue #1317).
-        let result = client.get_reservation(env, reservation_id);
+        let result = client.get_reservation(env.clone(), reservation_id);
         assert_eq!(result.unwrap_err(), ContractError::ReservationNotFound);
     }
 

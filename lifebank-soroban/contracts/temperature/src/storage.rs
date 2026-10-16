@@ -1,5 +1,5 @@
-use crate::types::{DataKey, TemperatureThreshold};
-use soroban_sdk::{Address, Env};
+use crate::types::{DataKey, TemperatureReading, TemperatureThreshold};
+use soroban_sdk::{Address, Env, Vec};
 
 /// TTL constants for persistent temperature entries (in ledgers; ~5 s each).
 /// Entries are bumped whenever their remaining TTL falls below the threshold.
@@ -29,7 +29,7 @@ pub fn get_threshold(env: &Env, unit_id: u64) -> Option<TemperatureThreshold> {
     env.storage().persistent().get(&DataKey::Threshold(unit_id))
 }
 
-pub fn set_temp_page(env: &Env, unit_id: u64, page: u32, readings: &soroban_sdk::Vec<i32>) {
+pub fn set_temp_page(env: &Env, unit_id: u64, page: u32, readings: &Vec<TemperatureReading>) {
     let key = DataKey::TempPage(unit_id, page);
     env.storage().persistent().set(&key, readings);
     env.storage()
@@ -37,8 +37,13 @@ pub fn set_temp_page(env: &Env, unit_id: u64, page: u32, readings: &soroban_sdk:
         .extend_ttl(&key, TEMP_BUMP_THRESHOLD, TEMP_BUMP_TO);
 }
 
-pub fn get_temp_page(env: &Env, unit_id: u64, page: u32) -> Option<soroban_sdk::Vec<i32>> {
-    env.storage().persistent().get(&DataKey::TempPage(unit_id, page))
+/// Returns the readings stored on `page`, or an empty Vec if the page has
+/// never been written.
+pub fn get_temp_page(env: &Env, unit_id: u64, page: u32) -> Vec<TemperatureReading> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TempPage(unit_id, page))
+        .unwrap_or_else(|| Vec::new(env))
 }
 
 pub fn set_temp_page_len(env: &Env, unit_id: u64, page: u32, len: u32) {
