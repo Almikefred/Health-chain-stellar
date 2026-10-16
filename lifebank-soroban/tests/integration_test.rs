@@ -25,6 +25,10 @@ use coordinator_contract::{
     CoordinatorContractClient, CoordinatorError, Payment, PaymentStatus, RequestStatus,
     WorkflowRecord, WorkflowStatus,
 };
+use temperature_contract::{
+    ExcursionSummary as TemperatureExcursionSummary, TemperatureContract,
+    TemperatureContractClient,
+};
 
 // ── Mock: Requests contract ───────────────────────────────────────────────────
 
@@ -185,14 +189,55 @@ impl MockPaymentContract {
             .expect("payment not found")
     }
 
-    /// Called by the coordinator in settle_payment (→ Released) and rollback (→ Refunded).
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) {
+    /// Called by the coordinator in settle_payment (→ Released).
+    pub fn update_status(
+        env: Env,
+        payment_id: u64,
+        status: PaymentStatus,
+        _caller: Address,
+    ) {
         let mut p: Payment = env
             .storage()
             .persistent()
             .get(&PayKey::Payment(payment_id))
             .expect("payment not found");
         p.status = status;
+        env.storage()
+            .persistent()
+            .set(&PayKey::Payment(payment_id), &p);
+    }
+
+    /// Called by the coordinator in rollback / expire_workflow (→ Refunded).
+    /// Only a Locked payment holds refundable funds, matching the real
+    /// payments contract's `refund_escrow` precondition.
+    pub fn refund_escrow(env: Env, _caller: Address, payment_id: u64) {
+        let mut p: Payment = env
+            .storage()
+            .persistent()
+            .get(&PayKey::Payment(payment_id))
+            .expect("payment not found");
+        if p.status == PaymentStatus::Locked {
+            p.status = PaymentStatus::Refunded;
+        }
+        env.storage()
+            .persistent()
+            .set(&PayKey::Payment(payment_id), &p);
+    }
+
+    /// Called by the coordinator when a temperature excursion is escalated.
+    pub fn record_dispute(
+        env: Env,
+        payment_id: u64,
+        _reason: coordinator_contract::DisputeReason,
+        _case_id: String,
+        _caller: Address,
+    ) {
+        let mut p: Payment = env
+            .storage()
+            .persistent()
+            .get(&PayKey::Payment(payment_id))
+            .expect("payment not found");
+        p.status = PaymentStatus::Disputed;
         env.storage()
             .persistent()
             .set(&PayKey::Payment(payment_id), &p);
@@ -561,5 +606,66 @@ fn test_rollback_after_settlement_is_rejected() {
         result,
         Err(Ok(CoordinatorError::CannotRollbackSettled)),
         "rollback must fail with CannotRollbackSettled on a settled workflow"
+    );
+}
+
+// ── Integration test 4: temperature excursion escalates to a payment dispute ──
+
+/// Registers the **real** temperature and coordinator contracts together with a
+/// mock payments contract, then drives a sustained cold-chain excursion through
+/// `temperature.report_excursion_to_coordinator`. The coordinator must accept
+/// the call from the configured oracle and move the linked `Locked` escrow to
+/// `Disputed` (issue #1615).
+#[test]
+fn test_temperature_excursion_disputes_locked_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let req_id = env.register(MockRequestContract, ());
+    let inv_id = env.register(MockInventoryContract, ());
+    let pay_id = env.register(MockPaymentContract, ());
+    let coord_id = env.register(CoordinatorContract, ());
+    let temp_id = env.register(TemperatureContract, ());
+
+    MockInventoryContractClient::new(&env, &inv_id).initialize(&admin);
+
+    // ── Coordinator: addresses + the one oracle address it trusts ────────────
+    let coord = CoordinatorContractClient::new(&env, &coord_id);
+    coord.initialize(&admin, &req_id, &inv_id, &pay_id);
+    coord.set_temperature_oracle(&admin, &oracle);
+
+    // ── Temperature: wire the coordinator and whitelist the oracle ───────────
+    let temp = TemperatureContractClient::new(&env, &temp_id);
+    temp.initialize(&admin);
+    temp.set_coordinator(&admin, &coord_id);
+    temp.add_oracle(&admin, &oracle);
+
+    // ── Drive a sustained excursion (3 consecutive violations) ───────────────
+    let unit_id = 42u64;
+    temp.set_threshold(&admin, &unit_id, &200, &600); // 2.00°C .. 6.00°C
+    temp.log_reading(&oracle, &unit_id, &1200); // 12.00°C — violation
+    temp.log_reading(&oracle, &unit_id, &1200);
+    temp.log_reading(&oracle, &unit_id, &1200);
+
+    let payment_id = MockPaymentContractClient::new(&env, &pay_id)
+        .seed_payment(&1u64, &PaymentStatus::Locked);
+
+    let excursion = TemperatureExcursionSummary {
+        unit_id,
+        violation_count: 3,
+        peak_celsius_x100: 1200,
+        detected_at: 0,
+    };
+    temp.report_excursion_to_coordinator(&oracle, &unit_id, &payment_id, &excursion);
+
+    assert_eq!(
+        MockPaymentContractClient::new(&env, &pay_id)
+            .get_payment(&payment_id)
+            .status,
+        PaymentStatus::Disputed,
+        "a sustained excursion must move the locked escrow to Disputed"
     );
 }

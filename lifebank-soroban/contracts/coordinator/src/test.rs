@@ -165,7 +165,12 @@ impl MockPaymentContract {
             .unwrap()
     }
 
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) {
+    pub fn update_status(
+        env: Env,
+        payment_id: u64,
+        status: PaymentStatus,
+        _caller: Address,
+    ) {
         let mut p: Payment = env
             .storage()
             .persistent()
@@ -177,11 +182,28 @@ impl MockPaymentContract {
             .set(&PayKey::Payment(payment_id), &p);
     }
 
+    /// Escrow-aware refund path (payments `refund_escrow`). Mirrors the real
+    /// contract's precondition: only a Locked payment can be refunded.
+    pub fn refund_escrow(env: Env, _caller: Address, payment_id: u64) {
+        let mut p: Payment = env
+            .storage()
+            .persistent()
+            .get(&PayKey::Payment(payment_id))
+            .unwrap();
+        if p.status == PaymentStatus::Locked {
+            p.status = PaymentStatus::Refunded;
+        }
+        env.storage()
+            .persistent()
+            .set(&PayKey::Payment(payment_id), &p);
+    }
+
     pub fn record_dispute(
         env: Env,
         payment_id: u64,
         _reason: super::payment_client::DisputeReason,
         _case_id: String,
+        _caller: Address,
     ) {
         let mut p: Payment = env
             .storage()
