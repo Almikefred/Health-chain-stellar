@@ -378,11 +378,70 @@ impl ReputationContract {
             .ok_or(Error::NotInitialized)
     }
 
+    /// Replace the accepted rating range. Admin only. Ratings already stored
+    /// keep their raw value and are normalised against the new range.
+    pub fn set_rating_scale_config(
+        env: Env,
+        caller: Address,
+        config: RatingScaleConfig,
+    ) -> Result<(), Error> {
+        Self::require_admin_auth(&env, &caller)?;
+        Self::require_not_paused(&env)?;
+        if config.min_rating < 0
+            || config.min_rating >= config.max_rating
+            || config.max_rating > 100
+        {
+            return Err(Error::InvalidInput);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::RatingScaleConfig, &config);
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Replace the inactivity-decay and rating-recency parameters. Admin only.
+    pub fn set_decay_config(env: Env, caller: Address, config: DecayConfig) -> Result<(), Error> {
+        Self::require_admin_auth(&env, &caller)?;
+        Self::require_not_paused(&env)?;
+        if config.decay_period_secs == 0
+            || config.rating_half_life_secs == 0
+            || !(0..=MAX_SCORE).contains(&config.max_decay)
+        {
+            return Err(Error::InvalidInput);
+        }
+        env.storage().instance().set(&DataKey::DecayConfig, &config);
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    fn rating_scale(env: &Env) -> RatingScaleConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::RatingScaleConfig)
+            .unwrap_or(RatingScaleConfig {
+                min_rating: DEFAULT_MIN_RATING,
+                max_rating: DEFAULT_MAX_RATING,
+            })
+    }
+
+    fn decay_config(env: &Env) -> DecayConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::DecayConfig)
+            .unwrap_or(DecayConfig {
+                decay_period_secs: DECAY_PERIOD_SECS,
+                max_decay: MAX_DECAY,
+                rating_half_life_secs: HALF_LIFE_SECS,
+            })
+    }
+
     // ── Write ──────────────────────────────────────────────────────────────────
 
     /// Submit a rating event for an entity and recalculate its score.
     ///
-    /// `score` must be 1–5 (inclusive). `caller` must be the configured admin.
+    /// `score` must lie within the configured rating scale (1–5 by default).
+    /// `caller` must be the configured admin.
     pub fn submit_rating(
         env: Env,
         caller: Address,
@@ -393,26 +452,27 @@ impl ReputationContract {
         Self::require_admin_auth(&env, &caller)?;
         Self::require_not_paused(&env)?;
         Self::require_valid_timestamp(&env, timestamp)?;
-        if !(1..=5).contains(&score) {
+        let scale = Self::rating_scale(&env);
+        if !(scale.min_rating..=scale.max_rating).contains(&score) {
             return Err(Error::InvalidRating);
         }
 
         let input_key = DataKey::Input(entity_id);
-        let mut input: ReputationInput = env
-            .storage()
-            .persistent()
-            .get(&input_key)
-            .unwrap_or(ReputationInput {
-                ratings: Vec::new(&env),
-                total_assigned: 0,
-                total_completed: 0,
-                total_response_secs: 0,
-                response_count: 0,
-                fraud_flags: 0,
-                last_active_at: timestamp,
-                penalties: Vec::new(&env),
-                next_penalty_id: 0,
-            });
+        let mut input: ReputationInput =
+            env.storage()
+                .persistent()
+                .get(&input_key)
+                .unwrap_or(ReputationInput {
+                    ratings: Vec::new(&env),
+                    total_assigned: 0,
+                    total_completed: 0,
+                    total_response_secs: 0,
+                    response_count: 0,
+                    fraud_flags: 0,
+                    last_active_at: timestamp,
+                    penalties: Vec::new(&env),
+                    next_penalty_id: 0,
+                });
 
         // Append rating (score stored ×100)
         input.ratings.push_back(RatingEvent {
@@ -430,9 +490,7 @@ impl ReputationContract {
         }
         input.last_active_at = timestamp;
 
-        env.storage()
-            .persistent()
-            .set(&input_key, &input);
+        env.storage().persistent().set(&input_key, &input);
         env.storage()
             .persistent()
             .extend_ttl(&input_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
@@ -452,24 +510,37 @@ impl ReputationContract {
         timestamp: u64,
     ) -> Result<ReputationScore, Error> {
         Self::require_admin_auth(&env, &caller)?;
+        Self::record_assignment_after_auth(env, entity_id, completed, response_secs, timestamp)
+    }
+
+    /// Body of record_assignment once the admin has authorized. Shared with
+    /// update_from_event: authorizing the same address twice in one frame
+    /// fails with Auth/ExistingValue, which made every event update abort.
+    fn record_assignment_after_auth(
+        env: Env,
+        entity_id: u64,
+        completed: bool,
+        response_secs: u64,
+        timestamp: u64,
+    ) -> Result<ReputationScore, Error> {
         Self::require_not_paused(&env)?;
         Self::require_valid_timestamp(&env, timestamp)?;
         let input_key = DataKey::Input(entity_id);
-        let mut input: ReputationInput = env
-            .storage()
-            .persistent()
-            .get(&input_key)
-            .unwrap_or(ReputationInput {
-                ratings: Vec::new(&env),
-                total_assigned: 0,
-                total_completed: 0,
-                total_response_secs: 0,
-                response_count: 0,
-                fraud_flags: 0,
-                last_active_at: timestamp,
-                penalties: Vec::new(&env),
-                next_penalty_id: 0,
-            });
+        let mut input: ReputationInput =
+            env.storage()
+                .persistent()
+                .get(&input_key)
+                .unwrap_or(ReputationInput {
+                    ratings: Vec::new(&env),
+                    total_assigned: 0,
+                    total_completed: 0,
+                    total_response_secs: 0,
+                    response_count: 0,
+                    fraud_flags: 0,
+                    last_active_at: timestamp,
+                    penalties: Vec::new(&env),
+                    next_penalty_id: 0,
+                });
 
         input.total_assigned = input.total_assigned.saturating_add(1);
         if completed {
@@ -479,9 +550,7 @@ impl ReputationContract {
         input.response_count = input.response_count.saturating_add(1);
         input.last_active_at = timestamp;
 
-        env.storage()
-            .persistent()
-            .set(&input_key, &input);
+        env.storage().persistent().set(&input_key, &input);
         env.storage()
             .persistent()
             .extend_ttl(&input_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
@@ -498,6 +567,16 @@ impl ReputationContract {
         timestamp: u64,
     ) -> Result<ReputationScore, Error> {
         Self::require_admin_auth(&env, &caller)?;
+        Self::flag_fraud_after_auth(env, entity_id, timestamp)
+    }
+
+    /// Body of flag_fraud once the admin has authorized (see
+    /// record_assignment_after_auth).
+    fn flag_fraud_after_auth(
+        env: Env,
+        entity_id: u64,
+        timestamp: u64,
+    ) -> Result<ReputationScore, Error> {
         Self::require_not_paused(&env)?;
         Self::require_valid_timestamp(&env, timestamp)?;
         let input_key = DataKey::Input(entity_id);
@@ -509,9 +588,7 @@ impl ReputationContract {
 
         input.fraud_flags += 1;
         input.last_active_at = timestamp;
-        env.storage()
-            .persistent()
-            .set(&input_key, &input);
+        env.storage().persistent().set(&input_key, &input);
         env.storage()
             .persistent()
             .extend_ttl(&input_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
@@ -543,25 +620,23 @@ impl ReputationContract {
 
         match event_kind {
             // Payment completed: record assignment as completed
-            0 => Self::record_assignment(
+            0 => Self::record_assignment_after_auth(
                 env.clone(),
-                caller,
                 entity_id,
                 true,
                 response_secs,
                 timestamp,
             ),
             // Dispute resolved in favor of the entity: count as a successful completion
-            1 => Self::record_assignment(
+            1 => Self::record_assignment_after_auth(
                 env.clone(),
-                caller,
                 entity_id,
                 true,
                 response_secs,
                 timestamp,
             ),
             // Dispute resolved against the entity: flag fraud (increment fraud counter)
-            2 => Self::flag_fraud(env.clone(), caller, entity_id, timestamp),
+            2 => Self::flag_fraud_after_auth(env.clone(), entity_id, timestamp),
             _ => Err(Error::InvalidInput),
         }
     }
@@ -607,9 +682,7 @@ impl ReputationContract {
             input.penalties = trimmed;
         }
 
-        env.storage()
-            .persistent()
-            .set(&input_key, &input);
+        env.storage().persistent().set(&input_key, &input);
         env.storage()
             .persistent()
             .extend_ttl(&input_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
@@ -648,9 +721,7 @@ impl ReputationContract {
             return Err(Error::PenaltyNotFound);
         }
 
-        env.storage()
-            .persistent()
-            .set(&input_key, &input);
+        env.storage().persistent().set(&input_key, &input);
         env.storage()
             .persistent()
             .extend_ttl(&input_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
@@ -670,6 +741,7 @@ impl ReputationContract {
             .get(&DataKey::Admin)
             .ok_or(Error::NotAuthorized)?;
         admin.require_auth();
+        Self::require_not_paused(&env)?;
 
         let input_key = DataKey::Input(entity_id);
         let mut input: ReputationInput = env
@@ -696,9 +768,7 @@ impl ReputationContract {
             input.penalties.set(idx, p);
         }
 
-        env.storage()
-            .persistent()
-            .set(&input_key, &input);
+        env.storage().persistent().set(&input_key, &input);
         env.storage()
             .persistent()
             .extend_ttl(&input_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
@@ -730,9 +800,12 @@ impl ReputationContract {
             .extend_ttl(&input_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
 
         let now = env.ledger().timestamp();
+        let scale = Self::rating_scale(&env);
+        let decay = Self::decay_config(&env);
 
         // 1. Recency-weighted rating component
-        let rating_component = Self::weighted_rating_score(&input.ratings, now);
+        let rating_component =
+            Self::weighted_rating_score(&input.ratings, now, &scale, decay.rating_half_life_secs);
 
         // 2. Completion rate component
         let completion_component =
@@ -764,7 +837,7 @@ impl ReputationContract {
         let after_penalties = (with_bonus - fraud_penalty - penalty_points).max(MIN_SCORE);
 
         // 7. Decay for inactivity
-        let decay_applied = Self::decay_penalty(input.last_active_at, now);
+        let decay_applied = Self::decay_penalty(input.last_active_at, now, &decay);
         let final_score = (after_penalties - decay_applied).clamp(MIN_SCORE, MAX_SCORE);
 
         let result = ReputationScore {
@@ -779,9 +852,7 @@ impl ReputationContract {
         };
 
         let score_key = DataKey::Score(entity_id);
-        env.storage()
-            .persistent()
-            .set(&score_key, &result);
+        env.storage().persistent().set(&score_key, &result);
         env.storage()
             .persistent()
             .extend_ttl(&score_key, INPUT_TTL_LEDGERS, INPUT_TTL_LEDGERS);
@@ -825,9 +896,14 @@ impl ReputationContract {
 
     /// Recency-weighted average rating, normalised to 0–100_00.
     ///
-    /// Ratings older than `HALF_LIFE_SECS` receive half the weight of recent ones.
-    /// Result is scaled ×100 (0–100_00).
-    fn weighted_rating_score(ratings: &Vec<RatingEvent>, now: u64) -> i64 {
+    /// Ratings older than `half_life_secs` receive half the weight of recent ones.
+    /// Result is scaled ×100 (0–100_00) relative to the configured rating scale.
+    fn weighted_rating_score(
+        ratings: &Vec<RatingEvent>,
+        now: u64,
+        scale: &RatingScaleConfig,
+        half_life_secs: u64,
+    ) -> i64 {
         if ratings.is_empty() {
             return 50_00; // neutral default
         }
@@ -839,7 +915,7 @@ impl ReputationContract {
             let r = ratings.get(i).unwrap();
             // Weight: 2 if recent, 1 if older than half-life
             let age = now.saturating_sub(r.timestamp);
-            let weight: i64 = if age < HALF_LIFE_SECS { 2 } else { 1 };
+            let weight: i64 = if age < half_life_secs { 2 } else { 1 };
             weighted_sum += r.score * weight; // score already ×100
             weight_total += weight;
         }
@@ -848,9 +924,12 @@ impl ReputationContract {
             return 50_00;
         }
 
-        let avg = weighted_sum / weight_total; // 100–500 range
-                                               // Normalise: (avg - 100) / 400 × 100_00
-        ((avg - 100) * 10_000) / 400
+        // Normalise the ×100 average onto 0–100_00 across [min, max]. Ratings
+        // recorded under a wider scale are clamped rather than overshooting.
+        let avg = weighted_sum / weight_total;
+        let lo = scale.min_rating * 100;
+        let span = (scale.max_rating - scale.min_rating) * 100;
+        (((avg - lo) * 10_000) / span).clamp(0, 10_000)
     }
 
     /// Completion rate → 0–100_00.
@@ -925,11 +1004,11 @@ impl ReputationContract {
 
     /// Decay penalty for inactivity.
     ///
-    /// 1 point per `DECAY_PERIOD_SECS` of inactivity, capped at `MAX_DECAY`.
-    fn decay_penalty(last_active: u64, now: u64) -> i64 {
+    /// 1 point per `decay_period_secs` of inactivity, capped at `max_decay`.
+    fn decay_penalty(last_active: u64, now: u64, config: &DecayConfig) -> i64 {
         let inactive = now.saturating_sub(last_active);
-        let periods = (inactive / DECAY_PERIOD_SECS) as i64;
-        (periods * 100).min(MAX_DECAY) // 1 point (×100) per period
+        let periods = (inactive / config.decay_period_secs) as i64;
+        periods.saturating_mul(100).min(config.max_decay) // 1 point (×100) per period
     }
 
     /// Integer square root (Newton's method, no_std safe).
@@ -976,9 +1055,12 @@ impl ReputationContract {
                 points /= 2;
             }
 
-            // Appeals might reduce weight or suspend penalty?
-            // For now, let's say appealed penalties still count but maybe less?
-            // Actually, let's keep it simple: they count full until resolved.
+            // A penalty under appeal counts at half weight until the admin
+            // resolves it. It is not dropped entirely: there is no "uphold"
+            // outcome, so suspending it would let an appeal cancel it outright.
+            if p.is_appealed {
+                points /= 2;
+            }
 
             total += points;
         }
