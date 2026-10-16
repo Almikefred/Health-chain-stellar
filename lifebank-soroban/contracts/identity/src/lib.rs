@@ -121,6 +121,8 @@ pub enum Error {
     AlreadyUnverified = 212,
     ContractPaused = 213,
     DeliveryAlreadyVerified = 214,
+    /// The owner address already has a registered organization.
+    OrganizationAlreadyRegistered = 215,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +188,21 @@ pub struct Organization {
     pub total_ratings: u32,
     pub location_hash: BytesN<32>,
 }
+
+/// One page of `get_verified_organizations`. `next_start` is the index to
+/// pass as `start` for the following page, or None once the list is exhausted.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VerifiedOrgPage {
+    pub items: Vec<Organization>,
+    pub next_start: Option<u32>,
+}
+
+/// Maximum number of type-index entries one `get_verified_organizations` call
+/// inspects, verified or not. Bounds the call's cost regardless of list size.
+const MAX_VERIFIED_SCAN: u32 = 200;
+/// Maximum number of organizations one `get_verified_organizations` call returns.
+const MAX_VERIFIED_RESULTS: u32 = 50;
 
 #[contractevent(topics = ["org_registered"], data_format = "vec")]
 #[derive(Clone, Debug)]
@@ -460,6 +477,15 @@ impl IdentityContract {
 
         let org_id = owner.clone();
 
+        // An owner maps to exactly one organization. Without this check a
+        // second registration overwrote the first (resetting verified status
+        // and ratings), appended a duplicate to OrgTypeList and bumped
+        // OrgCounter again.
+        let org_key = DataKey::Org(org_id.clone());
+        if env.storage().persistent().has(&org_key) {
+            return Err(Error::OrganizationAlreadyRegistered);
+        }
+
         let organization = Organization {
             id: org_id.clone(),
             org_type: org_type.clone(),
@@ -472,7 +498,6 @@ impl IdentityContract {
             location_hash,
         };
 
-        let org_key = DataKey::Org(org_id.clone());
         env.storage().persistent().set(&org_key, &organization);
         env.storage()
             .persistent()
@@ -629,23 +654,30 @@ impl IdentityContract {
         results
     }
 
-    /// Return verified organizations of the given type (up to max_results)
+    /// Return verified organizations of the given type, starting at index
+    /// `start` of the type list.
+    ///
+    /// At most MAX_VERIFIED_SCAN entries are inspected and at most
+    /// min(max_results, MAX_VERIFIED_RESULTS) are returned per call, so the
+    /// cost no longer grows with the number of registered organizations.
+    /// Continue from `next_start` until it is None.
     pub fn get_verified_organizations(
         env: Env,
         org_type: OrgType,
+        start: u32,
         max_results: u32,
-    ) -> Vec<Organization> {
+    ) -> VerifiedOrgPage {
         let list: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::OrgTypeList(org_type))
             .unwrap_or(Vec::new(&env));
 
-        let mut results = Vec::new(&env);
-        for i in 0..list.len() {
-            if results.len() >= max_results {
-                break;
-            }
+        let take = max_results.min(MAX_VERIFIED_RESULTS);
+        let end = start.saturating_add(MAX_VERIFIED_SCAN).min(list.len());
+        let mut items = Vec::new(&env);
+        let mut i = start;
+        while i < end && items.len() < take {
             let addr = list.get(i).unwrap();
             if let Some(org) = env
                 .storage()
@@ -653,11 +685,16 @@ impl IdentityContract {
                 .get::<DataKey, Organization>(&DataKey::Org(addr))
             {
                 if org.verified {
-                    results.push_back(org);
+                    items.push_back(org);
                 }
             }
+            i += 1;
         }
-        results
+
+        VerifiedOrgPage {
+            items,
+            next_start: if i < list.len() { Some(i) } else { None },
+        }
     }
 
     /// Return the rating of an organization (0 if not found)
@@ -678,7 +715,7 @@ impl IdentityContract {
     ) -> Vec<Organization> {
         const CAP: u32 = 50;
         let take = limit.min(CAP);
-        let all = Self::get_verified_organizations(env.clone(), org_type, CAP);
+        let all = Self::get_verified_organizations(env.clone(), org_type, 0, CAP).items;
         let n = all.len();
 
         // Track which indices have been selected already
