@@ -4,7 +4,9 @@ use super::*;
 use request_contract::{
     BloodComponent, BloodType, RequestContract, RequestContractClient, Urgency,
 };
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
+use soroban_sdk::{
+    testutils::storage::Instance as _, testutils::Address as _, testutils::Ledger as _, Address, Env,
+};
 
 fn setup<'a>() -> (Env, Address, RequestContractClient<'a>, Address) {
     let env = Env::default();
@@ -226,6 +228,7 @@ fn test_create_escrow_rejects_duplicate_request_id() {
 
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+    client.add_allowed_token(&admin, &token_id);
     let request_id = requests_client.create_request(
         &hospital,
         &BloodType::OPositive,
@@ -252,6 +255,7 @@ fn test_create_escrow_does_not_store_payment_when_transfer_fails() {
 
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 0);
+    client.add_allowed_token(&admin, &token_id);
     let request_id = requests_client.create_request(
         &hospital,
         &BloodType::OPositive,
@@ -613,9 +617,7 @@ fn test_update_status_changes_payment_status() {
     let admin = Address::generate(&env);
     client.initialize(&admin, &None);
     
-    let payer = Address::generate(&env);
-    let payee = Address::generate(&env);
-    let id = client.create_payment(&1u64, &payer, &payee, &500i128);
+    let (id, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 500);
 
     // Admin can change status
     client.update_status(&id, &PaymentStatus::Locked, &admin);
@@ -805,10 +807,6 @@ fn test_vesting_pre_cliff_claim_fails() {
     let token_id = deploy_token_with_balance(&env, &admin, &admin, 1_000_000);
     client.create_vesting(&admin, &donor, &token_id, &1_000_000i128, &1000u64, &2000u64);
 
-    // cliff = now + 1000s, duration = 2000s
-    env.ledger().with_mut(|l| l.timestamp = 5000);
-    client.create_vesting(&admin, &donor, &token_id, &1_000_000i128, &1000u64, &2000u64);
-
     // Try to claim at t=5500 (before cliff at t=6000)
     env.ledger().with_mut(|l| l.timestamp = 5500);
     let result = client.try_claim_vested(&donor);
@@ -825,8 +823,6 @@ fn test_vesting_partial_claim_at_50_percent() {
     let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
     let donor = Address::generate(&env);
-
-    let token_id = deploy_token_with_balance(&env, &admin, &cid, 1_000_000);
 
     // cliff = now + 0 (immediate), duration = 2000s → vest_end = now + 2000
     env.ledger().with_mut(|l| l.timestamp = 10_000);
@@ -856,9 +852,6 @@ fn test_vesting_full_claim_after_vest_end() {
     let token_id = deploy_token_with_balance(&env, &admin, &admin, 500_000);
     client.create_vesting(&admin, &donor, &token_id, &500_000i128, &0u64, &1000u64);
 
-    env.ledger().with_mut(|l| l.timestamp = 1_000);
-    client.create_vesting(&admin, &donor, &token_id, &500_000i128, &0u64, &1000u64);
-
     // Advance past vest_end
     env.ledger().with_mut(|l| l.timestamp = 3_000);
     let claimed = client.claim_vested(&donor);
@@ -879,16 +872,13 @@ fn test_vesting_cannot_exceed_total_amount() {
     let token_id = deploy_token_with_balance(&env, &admin, &admin, 1_000_000);
     client.create_vesting(&admin, &donor, &token_id, &1_000_000i128, &0u64, &1000u64);
 
-    env.ledger().with_mut(|l| l.timestamp = 1_000);
-    client.create_vesting(&admin, &donor, &token_id, &1_000_000i128, &0u64, &1000u64);
-
     // Claim full amount after vest end
     env.ledger().with_mut(|l| l.timestamp = 5_000);
     let first = client.claim_vested(&donor);
     assert_eq!(first, 1_000_000i128);
 
     // Second claim should fail with VestingNotFound
-    let result = client.try_claim_vested(&donor, &token_id);
+    let result = client.try_claim_vested(&donor);
     assert_eq!(
         result,
         Err(Ok(Error::VestingNotFound)),
@@ -903,8 +893,6 @@ fn test_vesting_only_admin_can_create() {
     let client = PaymentContractClient::new(&env, &cid);
     let attacker = Address::generate(&env);
     let donor = Address::generate(&env);
-    let token_id = deploy_token_with_balance(&env, &admin, &cid, 1_000);
-
     env.ledger().with_mut(|l| l.timestamp = 1_000);
     let token_id = deploy_token_with_balance(&env, &admin, &admin, 1_000);
     let result = client.try_create_vesting(&attacker, &donor, &token_id, &1_000i128, &100u64, &500u64);
@@ -938,6 +926,7 @@ fn test_process_expired_disputes_refunds_after_timeout() {
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+    client.add_allowed_token(&admin, &token_id);
 
     env.ledger().with_mut(|l| l.timestamp = 1_000);
     let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
@@ -974,6 +963,7 @@ fn test_process_expired_disputes_skips_non_expired() {
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+    client.add_allowed_token(&admin, &token_id);
 
     env.ledger().with_mut(|l| l.timestamp = 1_000);
     let pid = client.create_escrow(&2u64, &hospital, &payee, &500i128, &token_id);
@@ -1027,6 +1017,7 @@ fn test_resolve_dispute_releases_escrow_to_payee() {
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+    client.add_allowed_token(&admin, &token_id);
 
     // Create escrow payment: hospital deposits 1_000 tokens
     let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
@@ -1072,6 +1063,7 @@ fn test_resolve_dispute_refunds_escrow_to_payer() {
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+    client.add_allowed_token(&admin, &token_id);
 
     // Create escrow payment: hospital deposits 1_000 tokens
     let pid = client.create_escrow(&2u64, &hospital, &payee, &1_000i128, &token_id);
@@ -1107,6 +1099,7 @@ fn test_resolve_dispute_rejects_non_disputed_payment() {
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 10_000);
+    client.add_allowed_token(&admin, &token_id);
 
     // Create escrow payment (Locked, not Disputed)
     let pid = client.create_escrow(&3u64, &hospital, &payee, &500i128, &token_id);
@@ -1131,9 +1124,6 @@ fn test_vesting_events_emitted() {
     let token_id = deploy_token_with_balance(&env, &admin, &admin, 200_000);
     client.create_vesting(&admin, &donor, &token_id, &200_000i128, &0u64, &1000u64);
 
-    env.ledger().with_mut(|l| l.timestamp = 1_000);
-    client.create_vesting(&admin, &donor, &token_id, &200_000i128, &0u64, &1000u64);
-
     env.ledger().with_mut(|l| l.timestamp = 2_500); // past vest_end
     client.claim_vested(&donor);
 
@@ -1154,6 +1144,7 @@ fn test_create_escrow_transfers_tokens_to_contract() {
 
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
+    client.add_allowed_token(&admin, &token_id);
     let request_id = requests_client.create_request(
         &hospital,
         &BloodType::OPositive,
@@ -1192,6 +1183,7 @@ fn test_release_escrow_transfers_tokens_to_payee() {
 
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 2_000);
+    client.add_allowed_token(&admin, &token_id);
     let request_id = requests_client.create_request(
         &hospital,
         &BloodType::OPositive,
@@ -1235,6 +1227,7 @@ fn test_refund_escrow_returns_tokens_to_payer() {
 
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 4_000);
+    client.add_allowed_token(&admin, &token_id);
     let request_id = requests_client.create_request(
         &hospital,
         &BloodType::OPositive,
@@ -1278,6 +1271,7 @@ fn test_create_escrow_rejects_zero_amount() {
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+    client.add_allowed_token(&admin, &token_id);
 
     let result = client.try_create_escrow(&1u64, &hospital, &payee, &0i128, &token_id);
     assert_eq!(
@@ -1298,6 +1292,7 @@ fn test_create_escrow_rejects_negative_amount() {
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+    client.add_allowed_token(&admin, &token_id);
 
     let result = client.try_create_escrow(&1u64, &hospital, &payee, &-1i128, &token_id);
     assert_eq!(
@@ -1311,14 +1306,13 @@ fn test_create_escrow_rejects_negative_amount() {
 /// Security fix for issue #1120: prevents admin from bypassing escrow settlement.
 #[test]
 fn test_update_status_blocks_escrow_bypass() {
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
-    let admin = Address::generate(&env);
-    client.initialize(&admin, &None);
 
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
+    client.add_allowed_token(&admin, &token_id);
 
     // Create escrow payment (Locked status with token set)
     let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
@@ -1355,14 +1349,13 @@ fn test_update_status_blocks_escrow_bypass() {
 /// update_status allows non-terminal transitions on escrow payments (e.g., Locked → Disputed).
 #[test]
 fn test_update_status_allows_non_terminal_transitions() {
-    let (env, cid) = setup();
+    let (env, cid, admin) = setup_with_admin();
     let client = PaymentContractClient::new(&env, &cid);
-    let admin = Address::generate(&env);
-    client.initialize(&admin, &None);
 
     let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
+    client.add_allowed_token(&admin, &token_id);
 
     let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
 
@@ -1377,16 +1370,13 @@ fn test_update_status_allows_non_terminal_transitions() {
 /// update_status allows Released/Refunded on non-escrow payments (no token set).
 #[test]
 fn test_update_status_allows_terminal_on_non_escrow() {
-    let (env, cid) = setup();
+    let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
     let admin = Address::generate(&env);
     client.initialize(&admin, &None);
 
-    let hospital = Address::generate(&env);
-    let payee = Address::generate(&env);
-
     // Create non-escrow payment (token = None)
-    let pid = client.create_payment(&1u64, &hospital, &payee, &500i128);
+    let (pid, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 500);
 
     // Pending → Released should work (no escrow, no token to transfer)
     let result = client.try_update_status(&pid, &PaymentStatus::Released, &admin);

@@ -35,24 +35,6 @@ fn setup<'a>() -> (Env, Address, AnalyticsContractClient<'a>) {
     (env, admin, client)
 }
 
-fn setup_with_id<'a>() -> (Env, Address, Address, AnalyticsContractClient<'a>) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let inventory = Address::generate(&env);
-    let requests = Address::generate(&env);
-    let payments = Address::generate(&env);
-    let reputation = Address::generate(&env);
-
-    let id = env.register(AnalyticsContract, ());
-    let client = AnalyticsContractClient::new(&env, &id);
-
-    client.initialize(&admin, &inventory, &requests, &payments, &reputation);
-
-    (env, id, admin, client)
-}
-
 // ── Initialization ────────────────────────────────────────────────────────────
 
 #[test]
@@ -89,11 +71,11 @@ fn test_is_initialized_false_before_init() {
 
 #[test]
 fn test_config_instance_ttl_extended_on_initialize() {
-    let (env, id, client_admin, client) = setup_with_id();
+    let (env, client_admin, id, client) = setup_with_id();
     let ttl = env.as_contract(&id, || env.storage().instance().get_ttl());
 
     assert!(
-        ttl >= INSTANCE_TTL_MAX,
+        ttl >= INSTANCE_BUMP_TO,
         "config instance TTL was not extended"
     );
     assert_eq!(client.get_config().admin, client_admin);
@@ -101,17 +83,17 @@ fn test_config_instance_ttl_extended_on_initialize() {
 
 #[test]
 fn test_config_instance_ttl_reextended_on_read() {
-    let (env, id, _, client) = setup_with_id();
+    let (env, _, id, client) = setup_with_id();
 
     env.ledger().with_mut(|li| {
-        li.sequence_number += INSTANCE_TTL_MIN + 1;
+        li.sequence_number += INSTANCE_BUMP_THRESHOLD + 1;
     });
 
     let _ = client.get_config();
     let ttl = env.as_contract(&id, || env.storage().instance().get_ttl());
 
     assert!(
-        ttl >= INSTANCE_TTL_MAX,
+        ttl >= INSTANCE_BUMP_TO,
         "config instance TTL was not re-extended on read, got {ttl}"
     );
 }

@@ -284,7 +284,7 @@ impl VerificationTrait for VerificationImpl {
         Self::require_not_paused(&env)?;
 
         if org_ids.len() > MAX_BATCH_SIZE {
-            return Err(Error::BatchTooLarge);
+            return Err(Error::InvalidInput);
         }
 
         let mut verified_count = 0u32;
@@ -357,7 +357,7 @@ impl VerificationTrait for VerificationImpl {
         Self::require_not_paused(&env)?;
 
         if org_ids.len() > MAX_BATCH_SIZE {
-            return Err(Error::BatchTooLarge);
+            return Err(Error::InvalidInput);
         }
 
         let mut revoked_count = 0u32;
@@ -420,6 +420,14 @@ impl VerificationTrait for VerificationImpl {
 }
 
 impl VerificationImpl {
+    fn require_admin(env: &Env, account: &Address) -> Result<(), Error> {
+        IdentityContract::require_role(env, account, Role::Admin)
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), Error> {
+        IdentityContract::require_not_paused(env)
+    }
+
     /// Record a verification event in the audit trail
     fn record_verification_event(
         env: &Env,

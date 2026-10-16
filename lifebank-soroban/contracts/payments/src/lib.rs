@@ -554,6 +554,7 @@ mod request_client {
         pub assigned_units: Vec<u64>,
         pub fulfilled_quantity_ml: u32,
         pub reservation_id: Option<u64>,
+        pub fulfilled_by: Option<Address>,
         pub history: Vec<RequestHistoryEntry>,
     }
 
@@ -1538,10 +1539,13 @@ impl PaymentContract {
 
         store_vesting(&env, &schedule);
 
-        env.events().publish(
-            (symbol_short!("vest"), symbol_short!("created")),
-            (donor, total_amount, cliff_timestamp, vest_end_timestamp),
-        );
+        VestingCreated {
+            donor,
+            total_amount,
+            cliff_timestamp,
+            vest_end_timestamp,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -1550,11 +1554,9 @@ impl PaymentContract {
         donor.require_auth();
         Self::require_not_paused(&env)?;
 
+        // The payout token is the one bound to the schedule at creation
+        // (#1154); it is never caller-supplied.
         let mut schedule = load_vesting(&env, &donor).ok_or(Error::VestingNotFound)?;
-
-        if reward_token != schedule.reward_token {
-            return Err(Error::Unauthorized);
-        }
 
         let now = env.ledger().timestamp();
 

@@ -801,6 +801,6 @@ mod match_multiple_requests_integration_tests {
             ids.push_back(i + 1);
         }
         let result = client.try_match_multiple_requests(&ids);
-        assert_eq!(result, Ok(Err(MatchingError::BatchTooLarge)));
+        assert_eq!(result, Err(Ok(MatchingError::BatchTooLarge)));
     }
 }

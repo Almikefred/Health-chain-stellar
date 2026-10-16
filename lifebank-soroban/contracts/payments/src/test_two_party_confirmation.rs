@@ -28,10 +28,11 @@ mod confirmation_tests {
         let admin = Address::generate(&env);
         let hospital = Address::generate(&env);
         let blood_bank = Address::generate(&env);
-        let token = Address::generate(&env);
+        let token = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
 
         // Initialize contract
         client.initialize(&admin, &None);
+        client.add_allowed_token(&admin, &token);
 
         // Create escrow payment (hospital pays blood bank)
         let payment_id = client
@@ -74,9 +75,10 @@ mod confirmation_tests {
         let admin = Address::generate(&env);
         let hospital = Address::generate(&env);
         let blood_bank = Address::generate(&env);
-        let token = Address::generate(&env);
+        let token = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
 
         client.initialize(&admin, &None);
+        client.add_allowed_token(&admin, &token);
 
         let payment_id = client
             .create_escrow(&1u64, &hospital, &blood_bank, &500i128, &token);
