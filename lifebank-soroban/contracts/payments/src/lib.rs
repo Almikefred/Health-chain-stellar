@@ -554,6 +554,7 @@ mod request_client {
         pub assigned_units: Vec<u64>,
         pub fulfilled_quantity_ml: u32,
         pub reservation_id: Option<u64>,
+        pub fulfilled_by: Option<Address>,
         pub history: Vec<RequestHistoryEntry>,
     }
 
@@ -585,21 +586,33 @@ mod request_client {
 
 use request_client::{RequestContractClient, RequestStatus as ReqStatus};
 
-/// Returns Ok(()) if `request_id` exists and is in Pending or Approved status.
+/// Returns the decoded request when `request_id` exists, is in Pending or
+/// Approved status, and is being paid for by the requesting hospital.
+///
+/// The payer check is what stops a third party from squatting a `request_id`:
+/// both `create_payment` and `create_escrow` take a per-request index, so
+/// without it an attacker could lock the request with a minimal escrow and make
+/// the real hospital's payment fail with `DuplicatePayment`.
 fn validate_request_payable(
     env: &Env,
     requests_contract: &Address,
     request_id: u64,
-) -> Result<(), Error> {
+    payer: &Address,
+) -> Result<request_client::BloodRequest, Error> {
     let client = RequestContractClient::new(env, requests_contract);
     let req = client
         .try_get_request(&request_id)
         .map_err(|_| Error::RequestNotFound)?
         .map_err(|_| Error::RequestNotFound)?;
     match req.status {
-        ReqStatus::Pending | ReqStatus::Approved => Ok(()),
-        _ => Err(Error::RequestNotPayable),
+        ReqStatus::Pending | ReqStatus::Approved => {}
+        _ => return Err(Error::RequestNotPayable),
     }
+    // Only the hospital that raised the request may fund it.
+    if req.hospital_id != *payer {
+        return Err(Error::Unauthorized);
+    }
+    Ok(req)
 }
 
 /// Attempt to move the linked request to Cancelled via the requests contract.
@@ -817,7 +830,7 @@ impl PaymentContract {
             .instance()
             .get::<_, Address>(&REQ_CONTRACT)
             .ok_or(Error::RequestNotFound)?;
-        validate_request_payable(&env, &rc, request_id)?;
+        validate_request_payable(&env, &rc, request_id, &payer)?;
 
         let id = get_counter(&env) + 1;
         set_counter(&env, id);
@@ -902,7 +915,7 @@ impl PaymentContract {
 
         // Validate request state if the requests contract is configured.
         if let Some(rc) = env.storage().instance().get::<_, Address>(&REQ_CONTRACT) {
-            validate_request_payable(&env, &rc, request_id)?;
+            validate_request_payable(&env, &rc, request_id, &hospital)?;
         }
 
         let id = get_counter(&env) + 1;
@@ -1190,7 +1203,11 @@ impl PaymentContract {
         caller.require_auth();
         Self::require_not_paused(&env)?;
         let mut payment = load_payment(&env, payment_id).ok_or(Error::PaymentNotFound)?;
-        if caller != payment.payer && caller != payment.payee {
+        // The payer and payee may dispute a payment they are party to; the
+        // contract admin (e.g. the coordinator, which has the workflow context
+        // needed to attribute a temperature excursion to this payment) may also
+        // open a dispute on their behalf.
+        if caller != payment.payer && caller != payment.payee && !Self::is_admin(&env, &caller) {
             return Err(Error::Unauthorized);
         }
         // Only Pending or Locked payments may be disputed.  Raising a dispute

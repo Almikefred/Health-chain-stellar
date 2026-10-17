@@ -66,6 +66,8 @@ pub enum DataKey {
 }
 
 /// Status applied to all in-flight workflows when emergency_halt() is triggered.
+/// Retained for wire-format compatibility with off-chain indexers.
+#[allow(dead_code)]
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkflowHaltedStatus {
