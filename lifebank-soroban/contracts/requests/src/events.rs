@@ -15,6 +15,11 @@ pub struct RequestsInitialized {
     pub inventory_contract: Address,
 }
 
+#[contractevent(topics = ["payments_contract_set"], data_format = "single-value")]
+pub struct PaymentsContractSet {
+    pub payments_contract: Address,
+}
+
 #[contractevent(topics = ["request_cancelled"], data_format = "vec")]
 pub struct RequestCancelled {
     pub request_id: u64,
@@ -55,6 +60,13 @@ pub fn emit_request_created(env: &Env, request: &BloodRequest) {
         quantity_ml: request.quantity_ml,
         urgency: request.urgency.priority(),
         timestamp: request.created_timestamp,
+    }
+    .publish(env);
+}
+
+pub fn emit_payments_contract_set(env: &Env, payments_contract: &Address) {
+    PaymentsContractSet {
+        payments_contract: payments_contract.clone(),
     }
     .publish(env);
 }

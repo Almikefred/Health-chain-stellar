@@ -167,6 +167,10 @@ pub enum Error {
     InvalidStatusTransition = 523,
     /// The supplied token address is not on the admin-managed allowlist.
     TokenNotAllowed = 525,
+    /// No requests contract is configured; request validation cannot run.
+    RequestsContractNotSet = 526,
+    /// Batch exceeds `MAX_BATCH_SIZE` entries.
+    BatchTooLarge = 527,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -182,8 +186,13 @@ const TOTAL_OUTSTANDING_VESTING: soroban_sdk::Symbol = symbol_short!("OUT_VEST")
 const REQ_IDX: soroban_sdk::Symbol = symbol_short!("REQ_IDX");
 /// Instance-level aggregate stats.
 const STATS_KEY: soroban_sdk::Symbol = symbol_short!("STATS");
-/// Instance storage key for the requests contract address (optional).
+/// Instance storage key for the requests contract address. Required by
+/// `create_payment`/`create_escrow`; set via `initialize` or `set_requests_contract`.
 const REQ_CONTRACT: soroban_sdk::Symbol = symbol_short!("REQ_CTR");
+/// Maximum number of entries accepted by `batch_create_payments` and
+/// `process_expired_disputes`. Mirrors the sibling contracts' `MAX_BATCH_SIZE`
+/// so callers hit a dedicated error instead of the instruction or write limit.
+const MAX_BATCH_SIZE: u32 = 50;
 /// Default dispute auto-refund timeout in seconds (7 days).
 const DEFAULT_DISPUTE_TIMEOUT_SECS: u64 = 7 * 24 * 3600;
 /// Maximum allowed dispute timeout (365 days). Bounds the value admins can set
@@ -554,6 +563,7 @@ mod request_client {
         pub assigned_units: Vec<u64>,
         pub fulfilled_quantity_ml: u32,
         pub reservation_id: Option<u64>,
+        pub fulfilled_by: Option<Address>,
         pub history: Vec<RequestHistoryEntry>,
     }
 
@@ -574,11 +584,11 @@ mod request_client {
     #[allow(dead_code)]
     pub trait RequestContractInterface {
         fn get_request(env: Env, request_id: u64) -> BloodRequest;
-        fn update_request_status(
+        fn cancel_request_by_contract(
             env: Env,
-            caller: soroban_sdk::Address,
+            caller_contract: Address,
             request_id: u64,
-            new_status: RequestStatus,
+            reason: soroban_sdk::String,
         ) -> Result<(), soroban_sdk::Error>;
     }
 }
@@ -602,16 +612,43 @@ fn validate_request_payable(
     }
 }
 
-/// Attempt to move the linked request to Cancelled via the requests contract.
-/// Silently ignores failures (request may already be terminal or contract not configured).
-fn try_cancel_request(env: &Env, requests_contract: &Address, request_id: u64) {
+/// Attempt to move the linked request to Cancelled via the requests contract's
+/// `cancel_request_by_contract`, which trusts this contract's address.
+/// Best-effort so the payment refund is never blocked; returns whether the
+/// request was actually cancelled so callers only emit events on success.
+fn try_cancel_request(env: &Env, requests_contract: &Address, request_id: u64) -> bool {
     let client = RequestContractClient::new(env, requests_contract);
-    // Best-effort: ignore errors so the payment refund is never blocked.
-    let _ = client.try_update_request_status(
-        &env.current_contract_address(),
-        &request_id,
-        &ReqStatus::Cancelled,
-    );
+    matches!(
+        client.try_cancel_request_by_contract(
+            &env.current_contract_address(),
+            &request_id,
+            &String::from_str(env, "Dispute expired; escrow auto-refunded"),
+        ),
+        Ok(Ok(()))
+    )
+}
+
+/// Load the configured requests contract address, failing if unset.
+fn require_requests_contract(env: &Env) -> Result<Address, Error> {
+    env.storage()
+        .instance()
+        .get::<_, Address>(&REQ_CONTRACT)
+        .ok_or(Error::RequestsContractNotSet)
+}
+
+fn coord_ok_key(payment_id: u64) -> (u64, &'static str) {
+    (payment_id, "coord_ok")
+}
+
+fn hosp_ok_key(payment_id: u64) -> (u64, &'static str) {
+    (payment_id, "hosp_ok")
+}
+
+/// Drop both two-party release confirmations. Called on every transition out
+/// of Locked so a stale pre-dispute confirmation can never release funds later.
+fn clear_confirmations(env: &Env, payment_id: u64) {
+    env.storage().persistent().remove(&coord_ok_key(payment_id));
+    env.storage().persistent().remove(&hosp_ok_key(payment_id));
 }
 
 // ── Contract events ───────────────────────────────────────────────────────────
@@ -689,6 +726,11 @@ pub struct VestingClaimed {
     pub new_claimed: i128,
 }
 
+#[contractevent(topics = ["payment", "req_ctr"], data_format = "single-value")]
+pub struct RequestsContractSet {
+    pub requests_contract: Address,
+}
+
 #[contractevent(topics = ["request", "cancelled"], data_format = "vec")]
 pub struct RequestCancelledByPayment {
     pub request_id: u64,
@@ -704,7 +746,9 @@ pub struct PaymentContract;
 #[contractimpl]
 impl PaymentContract {
     /// Initialize the contract. Optionally provide the address of the requests
-    /// contract so that payment creation can validate request state.
+    /// contract so that payment creation can validate request state; it can
+    /// also be set or rotated later via `set_requests_contract`. Payment
+    /// creation fails with `RequestsContractNotSet` until it is configured.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -724,6 +768,27 @@ impl PaymentContract {
 
     pub fn version(_env: Env) -> u32 {
         CONTRACT_VERSION
+    }
+
+    /// Set or rotate the requests contract used to validate payable requests
+    /// and to cancel requests after auto-refunds. Admin only.
+    pub fn set_requests_contract(
+        env: Env,
+        admin: Address,
+        requests_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&REQ_CONTRACT, &requests_contract);
+        RequestsContractSet { requests_contract }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns the configured requests contract address, if any.
+    pub fn get_requests_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get::<_, Address>(&REQ_CONTRACT)
     }
 
     pub fn pause(env: Env, admin: Address) -> Result<(), Error> {
@@ -812,11 +877,7 @@ impl PaymentContract {
             return Err(Error::DuplicatePayment);
         }
 
-        let rc = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&REQ_CONTRACT)
-            .ok_or(Error::RequestNotFound)?;
+        let rc = require_requests_contract(&env)?;
         validate_request_payable(&env, &rc, request_id)?;
 
         let id = get_counter(&env) + 1;
@@ -856,6 +917,9 @@ impl PaymentContract {
         payments: Vec<(u64, Address, Address, i128)>,
     ) -> Result<Vec<u64>, Error> {
         Self::require_not_paused(&env)?;
+        if payments.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
         let mut ids: Vec<u64> = Vec::new(&env);
         for i in 0..payments.len() {
             let (request_id, payer, payee, amount) = payments.get(i).unwrap();
@@ -900,10 +964,9 @@ impl PaymentContract {
             return Err(Error::DuplicatePayment);
         }
 
-        // Validate request state if the requests contract is configured.
-        if let Some(rc) = env.storage().instance().get::<_, Address>(&REQ_CONTRACT) {
-            validate_request_payable(&env, &rc, request_id)?;
-        }
+        // Validate request state; mandatory, same as create_payment.
+        let rc = require_requests_contract(&env)?;
+        validate_request_payable(&env, &rc, request_id)?;
 
         let id = get_counter(&env) + 1;
         set_counter(&env, id);
@@ -967,14 +1030,14 @@ impl PaymentContract {
         }
 
         // Mark coordinator confirmation
-        let coord_key = (payment_id, "coord_ok");
+        let coord_key = coord_ok_key(payment_id);
         env.storage().persistent().set(&coord_key, &true);
         env.storage()
             .persistent()
             .extend_ttl(&coord_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 
         // Check if hospital has also confirmed
-        let hosp_key = (payment_id, "hosp_ok");
+        let hosp_key = hosp_ok_key(payment_id);
         let hospital_confirmed: bool = env.storage().persistent().get(&hosp_key).unwrap_or(false);
 
         if !hospital_confirmed {
@@ -1003,8 +1066,7 @@ impl PaymentContract {
         remove_from_request_index(&env, payment.request_id);
 
         // Clean up confirmation flags
-        env.storage().persistent().remove(&coord_key);
-        env.storage().persistent().remove(&hosp_key);
+        clear_confirmations(&env, payment_id);
 
         PaymentReleased {
             payment_id,
@@ -1032,14 +1094,14 @@ impl PaymentContract {
         }
 
         // Mark hospital confirmation
-        let hosp_key = (payment_id, "hosp_ok");
+        let hosp_key = hosp_ok_key(payment_id);
         env.storage().persistent().set(&hosp_key, &true);
         env.storage()
             .persistent()
             .extend_ttl(&hosp_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 
         // Check if coordinator has also confirmed
-        let coord_key = (payment_id, "coord_ok");
+        let coord_key = coord_ok_key(payment_id);
         let coordinator_confirmed: bool =
             env.storage().persistent().get(&coord_key).unwrap_or(false);
 
@@ -1069,8 +1131,7 @@ impl PaymentContract {
         remove_from_request_index(&env, payment.request_id);
 
         // Clean up confirmation flags
-        env.storage().persistent().remove(&coord_key);
-        env.storage().persistent().remove(&hosp_key);
+        clear_confirmations(&env, payment_id);
 
         PaymentReleased {
             payment_id,
@@ -1112,6 +1173,7 @@ impl PaymentContract {
         index_by_status(&env, PaymentStatus::Refunded, payment_id);
         update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded)?;
         remove_from_request_index(&env, payment.request_id);
+        clear_confirmations(&env, payment_id);
 
         PaymentRefunded {
             payment_id,
@@ -1160,6 +1222,9 @@ impl PaymentContract {
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, status, payment_id);
         update_stats_on_transition(&env, payment.amount, old_status, status)?;
+        if old_status == PaymentStatus::Locked && status != PaymentStatus::Locked {
+            clear_confirmations(&env, payment_id);
+        }
         if matches!(
             status,
             PaymentStatus::Released | PaymentStatus::Refunded | PaymentStatus::Cancelled
@@ -1210,6 +1275,8 @@ impl PaymentContract {
         remove_from_status_index(&env, old_status, payment_id);
         index_by_status(&env, PaymentStatus::Disputed, payment_id);
         update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Disputed)?;
+        // A dispute supersedes any earlier release confirmation.
+        clear_confirmations(&env, payment_id);
         PaymentDisputed {
             payment_id,
             reason_code: dispute_reason_to_code(reason),
@@ -1277,6 +1344,7 @@ impl PaymentContract {
         index_by_status(&env, new_status, payment_id);
         update_stats_on_transition(&env, payment.amount, old_status, new_status)?;
         remove_from_request_index(&env, payment.request_id);
+        clear_confirmations(&env, payment_id);
 
         // ── Emit events ───────────────────────────────────────────────────
         PaymentResolved { payment_id }.publish(&env);
@@ -1707,6 +1775,9 @@ impl PaymentContract {
         admin.require_auth();
         Self::require_not_paused(&env)?;
         Self::require_admin(&env, &admin)?;
+        if payment_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
 
         let timeout: u64 = env
             .storage()
@@ -1754,10 +1825,12 @@ impl PaymentContract {
             index_by_status(&env, PaymentStatus::Refunded, pid);
             update_stats_on_transition(&env, payment.amount, old_status, PaymentStatus::Refunded)?;
             remove_from_request_index(&env, payment.request_id);
+            clear_confirmations(&env, pid);
 
-            if let Some(ref rc) = req_contract {
-                try_cancel_request(&env, rc, payment.request_id);
-            }
+            let request_cancelled = match req_contract {
+                Some(ref rc) => try_cancel_request(&env, rc, payment.request_id),
+                None => false,
+            };
 
             PaymentRefunded {
                 payment_id: pid,
@@ -1765,12 +1838,16 @@ impl PaymentContract {
                 amount: payment.amount,
             }
             .publish(&env);
-            RequestCancelledByPayment {
-                request_id: payment.request_id,
-                payment_id: pid,
-                timestamp: now,
+            // Only announce the cancellation when the requests contract
+            // actually recorded it, so off-chain projections stay in sync.
+            if request_cancelled {
+                RequestCancelledByPayment {
+                    request_id: payment.request_id,
+                    payment_id: pid,
+                    timestamp: now,
+                }
+                .publish(&env);
             }
-            .publish(&env);
 
             refunded.push_back(pid);
         }
@@ -1834,3 +1911,4 @@ impl PaymentContract {
 mod test;
 mod test_two_party_confirmation;
 mod test_security_fixes;
+mod test_settlement_fixes;

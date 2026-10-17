@@ -27,6 +27,8 @@ pub enum ContractError {
     BatchTooLarge = 315,
     /// Attempted to overwrite an already-set fulfilling org; overwrite would silently lose the prior value.
     FulfillingOrgAlreadySet = 316,
+    /// No trusted payments contract has been configured.
+    PaymentsContractNotSet = 317,
 }
 
 #[cfg(test)]
@@ -55,6 +57,7 @@ mod tests {
             ContractError::ReservationAlreadySet,
             ContractError::BatchTooLarge,
             ContractError::FulfillingOrgAlreadySet,
+            ContractError::PaymentsContractNotSet,
         ];
 
         for i in 0..all.len() {
