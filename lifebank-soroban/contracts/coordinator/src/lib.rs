@@ -606,8 +606,8 @@ impl CoordinatorContract {
         unit_id: u64,
         payment_id: u64,
     ) -> Result<(), CoordinatorError> {
-        let admin = get_admin(&env)?;
-        admin.require_auth();
+        let caller = env.current_contract_address();
+        caller.require_auth();
 
         let workflow =
             load_workflow(&env, request_id).ok_or(CoordinatorError::WorkflowNotFound)?;
@@ -622,7 +622,7 @@ impl CoordinatorContract {
             &payment_id,
             &payment_client::DisputeReason::TemperatureExcursion,
             &String::from_str(&env, "temperature-breach"),
-            &admin,
+            &caller,
         );
 
         CoordTemperatureBreach {
