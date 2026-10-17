@@ -9,9 +9,8 @@
 //!   rollback with unlocked payment                       (idempotent refund guard)
 //!
 //! Why mocks instead of real contracts?
-//! The coordinator defines minimal proxy types (`BloodRequest {id, status}`,
-//! `BloodUnit {id, status}`, `Payment {id, request_id, status}`) that share only
-//! the fields it cares about. The real domain contracts use richer structs whose
+//! The coordinator defines minimal proxy types (`BloodRequest {id, blood_type, status}`,
+//! `BloodUnit {id, status, blood_type}`) that share only the fields it cares about. The real domain contracts use richer structs whose
 //! XDR encoding is incompatible with the coordinator's cross-contract client
 //! expectations. Mocks mirror the coordinator's type definitions exactly, keeping
 //! these tests focused on coordinator orchestration and cross-contract state.
@@ -42,7 +41,14 @@ impl MockRequestContract {
     pub fn seed_request(env: Env, id: u64, status: RequestStatus) {
         env.storage()
             .persistent()
-            .set(&ReqKey::Request(id), &BloodRequest { id, status });
+            .set(
+                &ReqKey::Request(id),
+                &BloodRequest {
+                    id,
+                    blood_type: BloodType::OPositive,
+                    status,
+                },
+            );
     }
 
     /// Called by the coordinator to check request status before allocating.
@@ -171,7 +177,16 @@ impl MockPaymentContract {
             &Payment {
                 id,
                 request_id,
+                payer: env.current_contract_address(),
+                payee: env.current_contract_address(),
+                amount: 100,
                 status,
+                created_at: 0,
+                updated_at: 0,
+                dispute_reason_code: None,
+                dispute_case_id: None,
+                dispute_resolved: false,
+                token: None,
             },
         );
         id
@@ -186,7 +201,7 @@ impl MockPaymentContract {
     }
 
     /// Called by the coordinator in settle_payment (→ Released) and rollback (→ Refunded).
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) {
+    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus, _caller: Address) {
         let mut p: Payment = env
             .storage()
             .persistent()
@@ -288,7 +303,6 @@ fn test_full_allocation_to_delivery_workflow() {
         &units,
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     // Workflow record should be Allocated.
@@ -399,7 +413,6 @@ fn test_rollback_releases_inventory_and_refunds_payment() {
         &units,
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     assert_eq!(get_unit(&h, unit_a).status, BloodStatus::Reserved);
@@ -465,7 +478,6 @@ fn test_rollback_with_pending_payment_does_not_refund() {
         &vec![&h.env, unit_id],
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     assert_eq!(get_unit(&h, unit_id).status, BloodStatus::Reserved);
@@ -513,7 +525,6 @@ fn test_settle_without_confirm_delivery_is_rejected() {
         &vec![&h.env, unit_id],
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     // Skip confirm_delivery — settle must fail.
@@ -547,7 +558,6 @@ fn test_rollback_after_settlement_is_rejected() {
         &vec![&h.env, unit_id],
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
     h.coord.confirm_delivery(
         &request_id,

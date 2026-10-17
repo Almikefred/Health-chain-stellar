@@ -1538,10 +1538,13 @@ impl PaymentContract {
 
         store_vesting(&env, &schedule);
 
-        env.events().publish(
-            (symbol_short!("vest"), symbol_short!("created")),
-            (donor, total_amount, cliff_timestamp, vest_end_timestamp),
-        );
+        VestingCreated {
+            donor,
+            total_amount,
+            cliff_timestamp,
+            vest_end_timestamp,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -1551,10 +1554,6 @@ impl PaymentContract {
         Self::require_not_paused(&env)?;
 
         let mut schedule = load_vesting(&env, &donor).ok_or(Error::VestingNotFound)?;
-
-        if reward_token != schedule.reward_token {
-            return Err(Error::Unauthorized);
-        }
 
         let now = env.ledger().timestamp();
 
