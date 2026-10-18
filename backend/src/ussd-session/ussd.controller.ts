@@ -17,6 +17,29 @@ import { Public } from '../auth/decorators/public.decorator';
 import { UssdService } from './ussd.service';
 
 /**
+ * Throttle tracker for the USSD gateway callback.
+ *
+ * Every USSD request arrives from the Africa's Talking gateway's egress IPs,
+ * not from the end user's phone, so keying by IP would put the entire user
+ * base into a single bucket. Key per phone number (falling back to the
+ * session id) so each user gets their own allowance.
+ */
+export function ussdThrottleTracker(req: {
+  body?: Record<string, string>;
+  ip?: string;
+}): string {
+  const phoneNumber = req.body?.phoneNumber;
+  if (phoneNumber) {
+    return `ussd:phone:${phoneNumber}`;
+  }
+  const sessionId = req.body?.sessionId;
+  if (sessionId) {
+    return `ussd:session:${sessionId}`;
+  }
+  return `ussd:ip:${req.ip ?? 'unknown'}`;
+}
+
+/**
  * Africa's Talking USSD gateway callback.
  *
  * The gateway posts a form-encoded body with no Authorization header, so the
@@ -26,7 +49,18 @@ import { UssdService } from './ussd.service';
  * check remains inside the USSD state machine.
  */
 @ApiTags('USSD')
-@Throttle({ default: { limit: 5, ttl: 60_000 } })
+@Throttle({
+  default: {
+    limit: 30,
+    ttl: 60_000,
+    getTracker: ussdThrottleTracker,
+  },
+  gateway: {
+    limit: 600,
+    ttl: 60_000,
+    getTracker: (req: { ip?: string }) => `ussd:gateway:${req.ip ?? 'unknown'}`,
+  },
+})
 @Controller('ussd')
 export class UssdController {
   constructor(private readonly ussdService: UssdService) {}
