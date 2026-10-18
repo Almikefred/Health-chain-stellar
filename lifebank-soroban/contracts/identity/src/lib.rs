@@ -1094,12 +1094,39 @@ impl IdentityContract {
             return Err(Error::OrganizationNotFound);
         }
 
-        // Verifier must be an authorized courier (Rider), the recipient who
-        // received the delivery, or the org that dispatched it. This prevents
-        // an arbitrary, unrelated address from fabricating a delivery proof.
+        // The delivery must match the real request: the recipient must be the
+        // requesting hospital, the org must be the one that fulfilled it, and
+        // the delivered quantity cannot exceed what was requested. Fails closed
+        // if the requests contract is unavailable.
+        let requests_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RequestsContract)
+            .ok_or(Error::Unauthorized)?;
+
+        let requests_client = request_client::RequestContractClient::new(&env, &requests_contract);
+        let request = requests_client
+            .try_get_request(&request_id)
+            .map_err(|_| Error::Unauthorized)?
+            .map_err(|_| Error::Unauthorized)?;
+
+        if request.hospital_id != recipient {
+            return Err(Error::Unauthorized);
+        }
+
+        if request.fulfilled_by != Some(org_id.clone()) {
+            return Err(Error::Unauthorized);
+        }
+
+        if quantity_delivered > request.quantity_ml {
+            return Err(Error::InvalidDeliveryProof);
+        }
+
+        // Verifier must be an authorized courier (Rider) or the recipient who
+        // received the delivery. The org that fulfilled the request is not an
+        // authorized verifier of its own delivery.
         let is_authorized = Self::has_role_internal(env.clone(), verifier.clone(), Role::Rider)
-            || verifier == recipient
-            || verifier == org_id;
+            || verifier == recipient;
         if !is_authorized {
             return Err(Error::Unauthorized);
         }
