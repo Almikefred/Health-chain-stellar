@@ -710,6 +710,9 @@ mod match_request_integration_tests {
             status: RequestStatus::Pending,
             assigned_units: soroban_sdk::Vec::new(env),
             fulfilled_quantity_ml: 0,
+            reservation_id: None,
+            fulfilled_by: None,
+            history: soroban_sdk::Vec::new(env),
         }
     }
 
