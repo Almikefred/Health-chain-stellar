@@ -18,6 +18,7 @@ pub enum ContractError {
     InvalidTimestamp = 115,
     InvalidQuantity = 116,
     InvalidExpiration = 117,
+    BatchTooLarge = 118,
 
     // State errors (120-129)
     AlreadyExists = 120,
