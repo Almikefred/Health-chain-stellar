@@ -8,7 +8,7 @@ mod types;
 mod validation;
 
 use crate::error::ContractError;
-use crate::types::{is_valid_transition, BloodStatus, BloodUnit, DataKey, Reservation, Role};
+use crate::types::{BloodStatus, BloodUnit, DataKey, Reservation, Role};
 
 pub use crate::types::{BloodStatus, BloodType, BloodUnit};
 
@@ -541,10 +541,8 @@ impl InventoryContract {
 
         // An invalid transition must fail: returning Ok with the status
         // unchanged reads as success to cross-contract callers (the
-        // coordinator would record a delivery that never happened).
-        if !is_valid_transition(&old_status, &new_status) {
-            events::emit_invalid_transition(&env, unit_id, old_status, new_status);
-        }
+        // coordinator would record a delivery that never happened). Soroban
+        // discards events from failed invocations, so no event is emitted here.
         validation::validate_status_transition(old_status, new_status)?;
 
         blood_unit.status = new_status;
