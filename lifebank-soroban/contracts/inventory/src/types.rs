@@ -259,6 +259,8 @@ pub enum Role {
     Rider,
     /// Hospital staff - can mark units as Delivered
     Hospital,
+    /// No role assigned (default for unknown addresses) - cannot transition any unit
+    Unprivileged,
 }
 
 /// Storage key types for efficient querying
@@ -296,6 +298,9 @@ pub enum DataKey {
     DonorIndexPage(Address, u32),
     BloodTypeIndexPage(BloodType, u32),
     StatusIndexPage(BloodStatus, u32),
+
+    /// Position of a blood unit inside its status index: blood_unit_id -> (page, slot)
+    StatusIndexSlot(u64),
 
     /// Authorized blood bank address
     AuthorizedBank(Address),

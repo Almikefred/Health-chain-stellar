@@ -69,6 +69,7 @@ pub struct InventoryContract;
 #[contractimpl]
 impl InventoryContract {
     const MAX_RESERVATION_DURATION_SECS: u64 = 86_400 * 7;
+    const MAX_BATCH_SIZE: u32 = 50;
     const CONTRACT_VERSION: u32 = 1;
 
     /// Initialize the inventory contract
@@ -169,17 +170,33 @@ impl InventoryContract {
         if admin != stored_admin {
             return Err(ContractError::Unauthorized);
         }
-        let role_key = DataKey::Role(grantee);
+        let role_key = DataKey::Role(grantee.clone());
         env.storage().persistent().set(&role_key, &role);
         env.storage().persistent().extend_ttl(
             &role_key,
             storage::TTL_THRESHOLD,
             storage::TTL_EXTEND_TO,
         );
+        events::emit_role_granted(&env, &grantee, role, &admin);
+        Ok(())
+    }
+
+    /// Revoke an address's role. Admin only.
+    pub fn revoke_role(env: Env, admin: Address, grantee: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Role(grantee.clone()));
+        events::emit_role_revoked(&env, &grantee, &admin);
         Ok(())
     }
 
     /// Get the role of an address. Returns Admin if address is contract admin, otherwise retrieves stored role.
+    /// Addresses without a stored role are `Unprivileged`.
     fn get_role(env: &Env, address: &Address) -> Role {
         let admin = storage::get_admin(env);
         if address == &admin {
@@ -188,7 +205,7 @@ impl InventoryContract {
             env.storage()
                 .persistent()
                 .get(&DataKey::Role(address.clone()))
-                .unwrap_or(Role::BloodBank)
+                .unwrap_or(Role::Unprivileged)
         }
     }
 
@@ -211,6 +228,7 @@ impl InventoryContract {
                 }
             }
             Role::BloodBank => Ok(()),
+            Role::Unprivileged => Err(ContractError::InsufficientRolePermission),
         }
     }
 
@@ -299,15 +317,11 @@ impl InventoryContract {
         // 5. Validate quantity
         validation::validate_quantity(quantity_ml)?;
 
-        // 6. Generate unique blood unit ID using atomic counter increment.
         // Reject duplicate serial numbers — physical blood bags have unique IDs
         let serial_key = DataKey::Serial(serial_number.clone());
         if env.storage().persistent().has(&serial_key) {
             return Err(ContractError::DuplicateBloodUnit);
         }
-
-        // Validate quantity
-        validation::validate_quantity(quantity_ml)?;
 
         // Generate unique blood unit ID using atomic counter increment.
         //
@@ -334,7 +348,6 @@ impl InventoryContract {
             return Err(ContractError::DuplicateBloodUnit);
         }
 
-        // 7. Compute timestamps from ledger time.
         // Compute timestamps from ledger time.
         // Using ledger time for both donation and expiration guarantees that
         // expiration checks (which compare against env.ledger().timestamp())
@@ -355,13 +368,6 @@ impl InventoryContract {
             metadata: Map::new(&env),
         };
 
-        // 8. Validate the complete blood unit
-        blood_unit.validate(current_time)?;
-
-        // 9. Store blood unit — only reaches here if the ID slot was empty.
-        storage::set_blood_unit(&env, &blood_unit);
-
-        // 10. Update indexes for efficient querying
         // Validate the complete blood unit
         blood_unit.validate(current_time)?;
 
@@ -382,7 +388,6 @@ impl InventoryContract {
         storage::add_to_status_index(&env, &blood_unit);
         storage::add_to_donor_index(&env, &blood_unit);
 
-        // 11. Emit event
         // Emit event
         events::emit_blood_registered(
             &env,
@@ -432,6 +437,7 @@ impl InventoryContract {
     pub fn get_units_by_blood_type(env: Env, blood_type: BloodType) -> Vec<u64> {
         let meta_key = DataKey::BloodTypeIndexMeta(blood_type);
         let last_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0u32);
+        storage::extend_page_ttl(&env, &meta_key);
 
         let mut all: Vec<u64> = Vec::new(&env);
         for p in 0..=last_page {
@@ -441,6 +447,7 @@ impl InventoryContract {
                 .persistent()
                 .get(&page_key)
                 .unwrap_or(Vec::new(&env));
+            storage::extend_page_ttl(&env, &page_key);
             for i in 0..page.len() {
                 all.push_back(page.get(i).unwrap());
             }
@@ -491,7 +498,12 @@ impl InventoryContract {
 
         let blood_unit = storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
 
-        let role = Self::get_role(&env, &authorized_by);
+        // The owning blood bank acts with the implicit BloodBank role unless a
+        // different role was explicitly stored for it.
+        let role = match Self::get_role(&env, &authorized_by) {
+            Role::Unprivileged if authorized_by == blood_unit.bank_id => Role::BloodBank,
+            role => role,
+        };
         Self::assert_can_transition(&role, &new_status)?;
 
         // Allow the transition when:
@@ -638,12 +650,24 @@ impl InventoryContract {
 
         Self::require_not_paused(&env)?;
 
+        if unit_ids.len() > Self::MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
         let admin = storage::get_admin(&env);
         let current_time = env.ledger().timestamp();
 
         // 1. Validate all units first (atomicity)
+        // Track seen unit IDs so a duplicate can't pass validation against the
+        // stored status and then record a bogus X→X transition in the update pass.
+        let mut seen_units = Map::<u64, bool>::new(&env);
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).ok_or(ContractError::NotFound)?;
+            if seen_units.contains_key(unit_id) {
+                return Err(ContractError::DuplicateBloodUnit);
+            }
+            seen_units.set(unit_id, true);
+
             let blood_unit =
                 storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
 
@@ -1009,6 +1033,34 @@ impl InventoryContract {
         }
 
         Self::release_reservation_internal(&env, &reservation, reservation_id, &caller)?;
+
+        Ok(())
+    }
+
+    /// Expire a reservation whose `expiration_timestamp` has passed, returning
+    /// all of its units to `Available`.
+    ///
+    /// Permissionless, so units stranded in `Reserved` can be recovered without
+    /// per-unit admin action. Expired reservations remain in storage for a grace
+    /// period (see `storage::set_reservation`), so this can be called any time
+    /// after expiry.
+    ///
+    /// # Errors
+    /// - `Paused` if the contract is paused
+    /// - `ReservationNotFound` if reservation does not exist
+    /// - `ReservationNotExpired` if the reservation has not yet expired
+    pub fn expire_reservation(env: Env, reservation_id: u64) -> Result<(), ContractError> {
+        Self::require_not_paused(&env)?;
+
+        let reservation = storage::get_reservation(&env, reservation_id)
+            .ok_or(ContractError::ReservationNotFound)?;
+
+        if env.ledger().timestamp() < reservation.expiration_timestamp {
+            return Err(ContractError::ReservationNotExpired);
+        }
+
+        let contract_address = env.current_contract_address();
+        Self::release_reservation_internal(&env, &reservation, reservation_id, &contract_address)?;
 
         Ok(())
     }

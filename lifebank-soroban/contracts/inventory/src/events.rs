@@ -1,4 +1,6 @@
-use crate::types::{AuditEvent, BloodRegisteredEvent, BloodStatus, BloodType, StatusChangeEvent};
+use crate::types::{
+    AuditEvent, BloodRegisteredEvent, BloodStatus, BloodType, Role, StatusChangeEvent,
+};
 use soroban_sdk::{contractevent, Address, Env, String};
 
 #[contractevent(topics = ["blood_reserved"], data_format = "vec")]
@@ -74,4 +76,21 @@ pub fn emit_blood_reserved(env: &Env, reservation_id: u64, requester: &Address, 
 
 pub fn emit_reservation_released(env: &Env, reservation_id: u64) {
     ReservationReleased { reservation_id }.publish(env);
+}
+
+pub fn emit_role_granted(env: &Env, grantee: &Address, role: Role, granted_by: &Address) {
+    RoleGranted {
+        grantee: grantee.clone(),
+        role,
+        granted_by: granted_by.clone(),
+    }
+    .publish(env);
+}
+
+pub fn emit_role_revoked(env: &Env, grantee: &Address, revoked_by: &Address) {
+    RoleRevoked {
+        grantee: grantee.clone(),
+        revoked_by: revoked_by.clone(),
+    }
+    .publish(env);
 }
