@@ -7,9 +7,9 @@ mod types;
 
 use crate::error::ContractError;
 use crate::types::{
-    DataKey, ExcursionSummary, PendingThresholdChange, TemperatureReading, TemperatureSummary,
-    TemperatureThreshold,
+    DataKey, PendingThresholdChange, TemperatureReading, TemperatureSummary, TemperatureThreshold,
 };
+pub use types::ExcursionSummary;
 use soroban_sdk::{contract, contractclient, contractevent, contractimpl, Address, Env, Vec};
 
 #[contractevent(topics = ["threshold", "proposed"], data_format = "vec")]
