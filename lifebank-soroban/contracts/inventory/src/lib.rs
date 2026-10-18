@@ -299,15 +299,11 @@ impl InventoryContract {
         // 5. Validate quantity
         validation::validate_quantity(quantity_ml)?;
 
-        // 6. Generate unique blood unit ID using atomic counter increment.
         // Reject duplicate serial numbers — physical blood bags have unique IDs
         let serial_key = DataKey::Serial(serial_number.clone());
         if env.storage().persistent().has(&serial_key) {
             return Err(ContractError::DuplicateBloodUnit);
         }
-
-        // Validate quantity
-        validation::validate_quantity(quantity_ml)?;
 
         // Generate unique blood unit ID using atomic counter increment.
         //
@@ -334,7 +330,6 @@ impl InventoryContract {
             return Err(ContractError::DuplicateBloodUnit);
         }
 
-        // 7. Compute timestamps from ledger time.
         // Compute timestamps from ledger time.
         // Using ledger time for both donation and expiration guarantees that
         // expiration checks (which compare against env.ledger().timestamp())
@@ -355,13 +350,6 @@ impl InventoryContract {
             metadata: Map::new(&env),
         };
 
-        // 8. Validate the complete blood unit
-        blood_unit.validate(current_time)?;
-
-        // 9. Store blood unit — only reaches here if the ID slot was empty.
-        storage::set_blood_unit(&env, &blood_unit);
-
-        // 10. Update indexes for efficient querying
         // Validate the complete blood unit
         blood_unit.validate(current_time)?;
 
@@ -382,7 +370,6 @@ impl InventoryContract {
         storage::add_to_status_index(&env, &blood_unit);
         storage::add_to_donor_index(&env, &blood_unit);
 
-        // 11. Emit event
         // Emit event
         events::emit_blood_registered(
             &env,
