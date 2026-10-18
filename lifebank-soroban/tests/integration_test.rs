@@ -9,12 +9,13 @@
 //!   rollback with unlocked payment                       (idempotent refund guard)
 //!
 //! Why mocks instead of real contracts?
-//! The coordinator defines minimal proxy types (`BloodRequest {id, status}`,
-//! `BloodUnit {id, status}`, `Payment {id, request_id, status}`) that share only
-//! the fields it cares about. The real domain contracts use richer structs whose
-//! XDR encoding is incompatible with the coordinator's cross-contract client
-//! expectations. Mocks mirror the coordinator's type definitions exactly, keeping
-//! these tests focused on coordinator orchestration and cross-contract state.
+//! These tests drive coordinator orchestration and need to place the domain
+//! contracts into states that the real contracts would only reach after a long
+//! sequence of authorized writes (a Delivered unit, a Released payment, ...).
+//! The mocks return the *full* mirrored structs declared by the coordinator, so
+//! these tests exercise the same decode path as the real contracts.
+//! `contracts/coordinator/src/test.rs::test_allocate_units_end_to_end_real_contracts`
+//! covers the same workflow against the real requests/inventory/payments code.
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, testutils::Address as _, vec, Address, Env, String,
@@ -44,9 +45,23 @@ struct MockRequestContract;
 impl MockRequestContract {
     /// Seed a request directly (test helper — not part of the real interface).
     pub fn seed_request(env: Env, id: u64, status: RequestStatus) {
-        env.storage()
-            .persistent()
-            .set(&ReqKey::Request(id), &BloodRequest { id, status });
+        let request = BloodRequest {
+            id,
+            hospital_id: env.current_contract_address(),
+            blood_type: coordinator_contract::BloodType::OPositive,
+            component: coordinator_contract::BloodComponent::WholeBlood,
+            quantity_ml: 450,
+            urgency: coordinator_contract::Urgency::Routine,
+            created_timestamp: 0,
+            required_by_timestamp: 0,
+            status,
+            assigned_units: soroban_sdk::Vec::new(&env),
+            fulfilled_quantity_ml: 0,
+            reservation_id: None,
+            fulfilled_by: None,
+            history: soroban_sdk::Vec::new(&env),
+        };
+        env.storage().persistent().set(&ReqKey::Request(id), &request);
     }
 
     /// Called by the coordinator to check request status before allocating.
@@ -92,14 +107,18 @@ impl MockInventoryContract {
             .unwrap_or(0u64)
             + 1;
         env.storage().instance().set(&InvKey::Counter, &id);
-        env.storage().persistent().set(
-            &InvKey::Unit(id),
-            &BloodUnit {
-                id,
-                status: BloodStatus::Available,
-                blood_type: coordinator_contract::BloodType::OPositive,
-            },
-        );
+        let unit = BloodUnit {
+            id,
+            blood_type: coordinator_contract::BloodType::OPositive,
+            quantity_ml: 450,
+            bank_id: env.current_contract_address(),
+            donor_id: None,
+            donation_timestamp: 0,
+            expiration_timestamp: 10_000_000,
+            status: BloodStatus::Available,
+            metadata: soroban_sdk::Map::new(&env),
+        };
+        env.storage().persistent().set(&InvKey::Unit(id), &unit);
         id
     }
 
@@ -170,14 +189,21 @@ impl MockPaymentContract {
             .unwrap_or(0u64)
             + 1;
         env.storage().instance().set(&PayKey::Counter, &id);
-        env.storage().persistent().set(
-            &PayKey::Payment(id),
-            &Payment {
-                id,
-                request_id,
-                status,
-            },
-        );
+        let payment = Payment {
+            id,
+            request_id,
+            payer: env.current_contract_address(),
+            payee: env.current_contract_address(),
+            amount: 1_000,
+            status,
+            created_at: 0,
+            updated_at: 0,
+            dispute_reason_code: None,
+            dispute_case_id: None,
+            dispute_resolved: false,
+            token: None,
+        };
+        env.storage().persistent().set(&PayKey::Payment(id), &payment);
         id
     }
 
@@ -189,13 +215,8 @@ impl MockPaymentContract {
             .expect("payment not found")
     }
 
-    /// Called by the coordinator in settle_payment (→ Released).
-    pub fn update_status(
-        env: Env,
-        payment_id: u64,
-        status: PaymentStatus,
-        _caller: Address,
-    ) {
+    /// Called by the coordinator in settle_payment (→ Released) and rollback (→ Refunded).
+    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus, _caller: Address) {
         let mut p: Payment = env
             .storage()
             .persistent()

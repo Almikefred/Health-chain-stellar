@@ -10,7 +10,7 @@ mod validation;
 use crate::error::ContractError;
 use crate::types::{is_valid_transition, BloodStatus, BloodUnit, DataKey, Reservation, Role};
 
-pub use crate::types::BloodType;
+pub use crate::types::{BloodStatus, BloodType, BloodUnit};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, Map, String, Vec};
 

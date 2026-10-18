@@ -39,7 +39,8 @@ fn make_payment(
     hospital: &Address,
     amount: i128,
 ) -> (u64, u64, Address, Address) {
-    let payer = Address::generate(env);
+    // Only the request's hospital may fund it, so the payer is the hospital.
+    let payer = hospital.clone();
     let payee = Address::generate(env);
     let request_id = requests_client.create_request(
         hospital,
@@ -138,7 +139,7 @@ fn test_create_payment_stores_correct_fields() {
     let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
     env.ledger().with_mut(|l| l.timestamp = 5000);
-    let payer = Address::generate(&env);
+    let payer = hospital.clone();
     let payee = Address::generate(&env);
     let request_id = requests_client.create_request(
         &hospital,
@@ -248,6 +249,97 @@ fn test_create_escrow_rejects_duplicate_request_id() {
     assert_eq!(result, Err(Ok(Error::DuplicatePayment)));
 }
 
+// ── #1619: only the request's hospital may fund it ────────────────────────────
+
+#[test]
+fn test_create_payment_rejects_non_hospital_payer() {
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let attacker = Address::generate(&env);
+    let payee = Address::generate(&env);
+
+    let request_id = requests_client.create_request(
+        &hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &250u32,
+        &Urgency::Routine,
+        &(env.ledger().timestamp() + 3_600),
+    );
+
+    let result = client.try_create_payment(&request_id, &attacker, &payee, &500i128);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    // The squatting attempt must not block the real hospital's payment.
+    let id = client.create_payment(&request_id, &hospital, &payee, &500i128);
+    assert_eq!(client.get_payment(&id).payer, hospital);
+}
+
+#[test]
+fn test_create_escrow_rejects_non_hospital_payer() {
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None);
+
+    let attacker = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let attacker_token = deploy_token_with_balance(&env, &admin, &attacker, 5_000);
+    client.add_allowed_token(&admin, &attacker_token);
+
+    let request_id = requests_client.create_request(
+        &hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &250u32,
+        &Urgency::Routine,
+        &(env.ledger().timestamp() + 3_600),
+    );
+
+    let result =
+        client.try_create_escrow(&request_id, &attacker, &payee, &1_000i128, &attacker_token);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
+    // The request is still free: the real hospital can escrow against it.
+    let hospital_token = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
+    client.add_allowed_token(&admin, &hospital_token);
+    let id =
+        client.create_escrow(&request_id, &hospital, &payee, &1_000i128, &hospital_token);
+    assert_eq!(client.get_payment(&id).status, PaymentStatus::Locked);
+}
+
+// ── record_dispute: authorized disputers ──────────────────────────────────────
+
+#[test]
+fn test_record_dispute_allows_contract_admin_but_not_strangers() {
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None);
+
+    let (payment_id, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 500);
+    client.record_dispute(
+        &payment_id,
+        &DisputeReason::TemperatureExcursion,
+        &soroban_sdk::String::from_str(&env, "temp-excursion"),
+        &admin,
+    );
+    assert_eq!(
+        client.get_payment(&payment_id).status,
+        PaymentStatus::Disputed
+    );
+
+    let stranger = Address::generate(&env);
+    let (other_id, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 500);
+    let result = client.try_record_dispute(
+        &other_id,
+        &DisputeReason::TemperatureExcursion,
+        &soroban_sdk::String::from_str(&env, "temp-excursion"),
+        &stranger,
+    );
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
 #[test]
 fn test_create_escrow_does_not_store_payment_when_transfer_fails() {
     let (env, cid, requests_client, hospital) = setup();
@@ -310,7 +402,7 @@ fn test_terminal_payment_does_not_block_new_active_payment_for_different_request
 fn test_get_payments_by_payer_returns_only_payer_payments() {
     let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
-    let payer_a = Address::generate(&env);
+    let payer_a = hospital.clone();
     let payee = Address::generate(&env);
 
     let request_1 = requests_client.create_request(
@@ -331,7 +423,10 @@ fn test_get_payments_by_payer_returns_only_payer_payments() {
         &(env.ledger().timestamp() + 3_600),
     );
     let _ = client.create_payment(&request_2, &payer_a, &payee, &200i128);
-    let _ = make_payment(&env, &client, &requests_client, &hospital, 300);
+    // A second hospital's payment must not be attributed to this payer.
+    let hospital_b = Address::generate(&env);
+    requests_client.authorize_hospital(&hospital_b);
+    let _ = make_payment(&env, &client, &requests_client, &hospital_b, 300);
 
     let page = client.get_payments_by_payer(&payer_a, &0u32, &20u32);
     assert_eq!(page.items.len(), 2);
@@ -352,7 +447,7 @@ fn test_get_payments_by_payer_empty_result() {
 fn test_get_payments_by_payer_pagination() {
     let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
-    let payer = Address::generate(&env);
+    let payer = hospital.clone();
     let payee = Address::generate(&env);
 
     for _i in 1u64..=5 {
@@ -384,7 +479,7 @@ fn test_get_payments_by_payer_pagination() {
 fn test_get_payments_by_payee_returns_only_payee_payments() {
     let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
-    let payer = Address::generate(&env);
+    let payer = hospital.clone();
     let payee_a = Address::generate(&env);
 
     let request_1 = requests_client.create_request(
@@ -416,7 +511,7 @@ fn test_get_payments_by_payee_returns_only_payee_payments() {
 fn test_get_payments_by_payee_pagination() {
     let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
-    let payer = Address::generate(&env);
+    let payer = hospital.clone();
     let payee = Address::generate(&env);
 
     for i in 1u64..=6 {
@@ -618,9 +713,7 @@ fn test_update_status_changes_payment_status() {
     let client = PaymentContractClient::new(&env, &cid);
     let admin = Address::generate(&env);
     client.initialize(&admin, &None);
-
-    let payer = Address::generate(&env);
-    let payee = Address::generate(&env);
+    
     let request_id = requests_client.create_request(
         &hospital,
         &BloodType::OPositive,
@@ -629,7 +722,8 @@ fn test_update_status_changes_payment_status() {
         &Urgency::Routine,
         &(env.ledger().timestamp() + 3_600),
     );
-    let id = client.create_payment(&request_id, &payer, &payee, &500i128);
+    let payee = Address::generate(&env);
+    let id = client.create_payment(&request_id, &hospital, &payee, &500i128);
 
     // Admin can change status
     client.update_status(&id, &PaymentStatus::Locked, &admin);
