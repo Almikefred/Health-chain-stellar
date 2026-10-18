@@ -219,30 +219,33 @@ impl MatchingContract {
                     // Only usable units count toward the cap (#1457). The type
                     // index also holds Reserved/Delivered/Expired/... units;
                     // letting them fill the cap would hide Available units
-                    if unit.status == BloodStatus::Available && unit.expiration_timestamp > now {
+                    if unit.status == BloodStatus::Available {
                         candidates.push_back(unit);
                     }
                 }
             }
         }
 
-        let matched = select_units(env, &candidates, request.blood_type, request.quantity_ml);
+        let selected = select_units(env, &candidates, request.blood_type, request.quantity_ml, now);
 
-        let mut total_allocated: u32 = 0;
-        let mut matched_units: Vec<MatchedUnit> = Vec::new(env);
-        for k in 0..matched.len() {
-            let m = matched.get(k).unwrap();
-            total_allocated += m.quantity_ml;
-            matched_units.push_back(m);
+        let mut matched: Vec<MatchedUnit> = Vec::new(env);
+        let mut total_ml: u32 = 0;
+        for i in 0..selected.len() {
+            let unit = selected.get(i).unwrap();
+            total_ml = total_ml.saturating_add(unit.quantity_ml);
+            matched.push_back(MatchedUnit {
+                blood_unit_id: unit.id,
+                blood_type: unit.blood_type,
+                quantity_ml: unit.quantity_ml,
+                score: score_unit(&unit, request.blood_type, now),
+            });
         }
-
-        let partial = total_allocated < request.quantity_ml;
 
         Ok(MatchResult {
             request_id,
-            matched_units,
-            total_allocated_ml: total_allocated,
-            partial_fulfillment: partial,
+            matched_units: matched,
+            total_matched_ml: total_ml,
+            is_partial: total_ml < request.quantity_ml,
         })
     }
 
