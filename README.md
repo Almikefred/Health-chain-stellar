@@ -126,3 +126,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1644 -->
 - #1644: [lifebank/reputation] update_from_event treats every lost dispute as confirmed fraud, and event kinds 0 and 1 are identical
+
+<!-- handsoff-issue-1645 -->
+- #1645: [lifebank/reputation] calculate_reputation is an unauthenticated public write that ignores pause, and get_score returns stale scores that never include decay
