@@ -774,6 +774,64 @@ impl IdentityContract {
         Ok(())
     }
 
+    /// Get verification metadata for an organization
+    pub fn get_verification_metadata(
+        env: Env,
+        org_id: Address,
+    ) -> Result<verification::VerificationMetadata, Error> {
+        <verification::VerificationImpl as verification::VerificationTrait>::get_verification_metadata(
+            env, org_id,
+        )
+    }
+
+    /// Check if an organization is verified
+    pub fn is_organization_verified(env: Env, org_id: Address) -> Result<bool, Error> {
+        <verification::VerificationImpl as verification::VerificationTrait>::is_organization_verified(
+            env, org_id,
+        )
+    }
+
+    /// Get the verification timestamp of an organization
+    pub fn get_verification_timestamp(env: Env, org_id: Address) -> Result<Option<u64>, Error> {
+        <verification::VerificationImpl as verification::VerificationTrait>::get_verification_timestamp(
+            env, org_id,
+        )
+    }
+
+    /// Get the last N verification events for an organization
+    pub fn get_verification_events(
+        env: Env,
+        org_id: Address,
+        limit: u32,
+    ) -> Result<Vec<verification::VerificationEvent>, Error> {
+        <verification::VerificationImpl as verification::VerificationTrait>::get_verification_events(
+            env, org_id, limit,
+        )
+    }
+
+    /// Batch verify organizations (admin only). Returns the number newly verified.
+    pub fn batch_verify_organizations(
+        env: Env,
+        admin: Address,
+        org_ids: Vec<Address>,
+    ) -> Result<u32, Error> {
+        <verification::VerificationImpl as verification::VerificationTrait>::batch_verify_organizations(
+            env, admin, org_ids,
+        )
+    }
+
+    /// Batch revoke organizations (admin only). Returns the number newly revoked.
+    pub fn batch_revoke_organizations(
+        env: Env,
+        admin: Address,
+        org_ids: Vec<Address>,
+        reason: String,
+    ) -> Result<u32, Error> {
+        <verification::VerificationImpl as verification::VerificationTrait>::batch_revoke_organizations(
+            env, admin, org_ids, reason,
+        )
+    }
+
     // -----------------------------------------------------------------------
     // Rating
     // -----------------------------------------------------------------------
