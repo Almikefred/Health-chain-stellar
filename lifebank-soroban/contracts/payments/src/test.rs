@@ -1328,8 +1328,6 @@ fn test_create_escrow_rejects_negative_amount() {
 fn test_update_status_blocks_escrow_bypass() {
     let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
-    let admin = Address::generate(&env);
-    client.initialize(&admin, &None);
 
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
@@ -1384,8 +1382,6 @@ fn test_update_status_blocks_escrow_bypass() {
 fn test_update_status_allows_non_terminal_transitions() {
     let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
-    let admin = Address::generate(&env);
-    client.initialize(&admin, &None);
 
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);

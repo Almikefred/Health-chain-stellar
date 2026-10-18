@@ -1644,6 +1644,8 @@ impl PaymentContract {
         donor.require_auth();
         Self::require_not_paused(&env)?;
 
+        // The payout token is the one bound to the schedule at creation
+        // (#1154); it is never caller-supplied.
         let mut schedule = load_vesting(&env, &donor).ok_or(Error::VestingNotFound)?;
 
         let now = env.ledger().timestamp();

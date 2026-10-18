@@ -14,7 +14,7 @@ pub use matching::{
 };
 pub use types::{
     BloodComponent, BloodRequest, BloodStatus, BloodType, BloodUnit, DataKey, MatchKind,
-    MatchResult, MatchedUnit, RequestStatus, Urgency,
+    MatchResult, MatchedUnit, RequestHistoryEntry, RequestStatus, Urgency,
 };
 
 use soroban_sdk::{contract, contractclient, contractimpl, Address, Env, Vec};
@@ -197,6 +197,7 @@ impl MatchingContract {
         let inv_client = InventoryContractClient::new(env, &inv_addr);
 
         let compatible_types = compatible_donor_types(env, request.blood_type);
+        let now = env.ledger().timestamp();
 
         let mut candidates: Vec<BloodUnit> = Vec::new(env);
         for i in 0..compatible_types.len() {
@@ -215,6 +216,13 @@ impl MatchingContract {
                     continue;
                 }
                 if let Ok(Ok(unit)) = inv_client.try_get_blood_unit(&uid) {
+                    // Only usable units count toward the cap (#1457). The type
+                    // index also holds Reserved/Delivered/Expired/... units;
+                    // letting them fill the cap would hide Available units
+                    // further down the index and cause false "no match" results.
+                    if unit.status != BloodStatus::Available || unit.expiration_timestamp <= now {
+                        continue;
+                    }
                     candidates.push_back(unit);
                 }
             }
@@ -223,7 +231,6 @@ impl MatchingContract {
             }
         }
 
-        let now = env.ledger().timestamp();
         let matched = select_units(
             env,
             candidates,

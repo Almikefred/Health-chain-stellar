@@ -425,6 +425,28 @@ fn test_allocate_blocked_for_non_pending_request() {
 
 // ── Rollback ──────────────────────────────────────────────────────────────────
 
+/// Issue #1446: rollback only accepts an Allocated workflow, so rolling back an
+/// already rolled-back workflow is rejected instead of re-releasing its units.
+#[test]
+fn test_rollback_twice_is_rejected() {
+    let h = setup();
+    seed_pending_request(&h, 1);
+    let unit_id = register_unit(&h);
+    let payment_id = create_locked_payment(&h, 1);
+
+    h.coord.allocate_units(
+        &1u64,
+        &vec![&h.env, unit_id],
+        &payment_id,
+        &h.admin,
+        &BloodType::OPositive,
+    );
+    h.coord.rollback(&1u64);
+
+    let result = h.coord.try_rollback(&1u64);
+    assert_eq!(result, Err(Ok(CoordinatorError::InvalidWorkflowState)));
+}
+
 #[test]
 fn test_rollback_releases_units_and_refunds_payment() {
     let h = setup();
