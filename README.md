@@ -129,3 +129,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1645 -->
 - #1645: [lifebank/reputation] calculate_reputation is an unauthenticated public write that ignores pause, and get_score returns stale scores that never include decay
+
+<!-- handsoff-issue-1646 -->
+- #1646: [lifebank/temperature] set_threshold lets the admin bypass the 7-day threshold-change timelock entirely
