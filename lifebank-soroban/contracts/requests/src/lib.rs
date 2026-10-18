@@ -354,6 +354,12 @@ impl RequestContract {
             return Err(ContractError::NotRequestOwner);
         }
 
+        // Units in an InProgress request are already on a rider's vehicle;
+        // cancelling would release their reservation while they are in transit.
+        if request.status == RequestStatus::InProgress {
+            return Err(ContractError::InvalidRequestStatus);
+        }
+
         Self::cancel_internal(&env, &mut request, &caller, reason)
     }
 
