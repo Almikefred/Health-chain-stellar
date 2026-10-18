@@ -28,12 +28,16 @@ import { WorkingHoursDto } from './dto/working-hours.dto';
 import { RiderEntity } from './entities/rider.entity';
 import { RiderStatus } from './enums/rider-status.enum';
 import { RidersService } from './riders.service';
+import { RiderSearchService } from './services/rider-search.service';
 
 @ApiTags('Riders')
 @ApiBearerAuth()
 @Controller('riders')
 export class RidersController {
-  constructor(private readonly ridersService: RidersService) {}
+  constructor(
+    private readonly ridersService: RidersService,
+    private readonly riderSearchService: RiderSearchService,
+  ) {}
 
   @RequirePermissions(Permission.VIEW_RIDERS)
   @ApiOperation({ summary: 'Get' })
@@ -116,7 +120,7 @@ export class RidersController {
     )
     query: PaginationQueryDto,
   ) {
-    return this.ridersService.search(query);
+    return this.riderSearchService.searchRiders(query);
   }
 
   @RequirePermissions(Permission.VIEW_RIDERS)
@@ -234,32 +238,34 @@ export class RidersController {
     return this.ridersService.setPreferredAreas(id, areas);
   }
 
-  @RequirePermissions(Permission.DELETE_RIDER)
+  @RequirePermissions(Permission.UPDATE_RIDER)
   @ApiOperation({ summary: 'Delete :id' })
   @ApiResponse({ status: 200, description: 'Resource deleted successfully' })
   @Delete(':id')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  remove(@Param('id') id: string) {
+  async remove(
+    @Param('id') id: string,
+    @User() user: { id: string; permissions?: Permission[] },
+  ) {
+    await this.assertRiderAccess(id, user);
     return this.ridersService.remove(id);
   }
 
-  /**
-   * Ensures the caller may act on the given rider id. Admins (MANAGE_RIDERS)
-   * keep full access; everyone else may only act on their own rider record.
-   */
   private async assertRiderAccess(
-    id: string,
+    riderId: string,
     user: { id: string; permissions?: Permission[] },
   ): Promise<void> {
-    if (user?.permissions?.includes(Permission.MANAGE_RIDERS)) {
+    const permissions = user?.permissions ?? [];
+    if (
+      permissions.includes(Permission.MANAGE_RIDERS) ||
+      permissions.includes(Permission.UPDATE_RIDER)
+    ) {
       return;
     }
 
-    const rider = await this.ridersService.findByUserId(user.id);
-    if (!rider || rider.id !== id) {
-      throw new ForbiddenException(
-        'You are not allowed to modify another rider\'s record',
-      );
+    const rider = await this.ridersService.findOne(riderId);
+    const riderUserId = rider?.data?.id;
+    if (!riderUserId || riderUserId !== user?.id) {
+      throw new ForbiddenException('You do not have access to this rider');
     }
   }
 }
