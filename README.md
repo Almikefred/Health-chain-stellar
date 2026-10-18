@@ -123,3 +123,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1482 -->
 - #1482: [lifebank/temperature] compute_excursion_data trusts stale is_violation flags computed under a historical threshold instead of re-validating against the current one
+
+<!-- handsoff-issue-1652 -->
+- #1652: [lifebank] Only the coordinator supports admin transfer; the other nine contracts have a permanently fixed admin key
