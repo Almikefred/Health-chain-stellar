@@ -710,6 +710,9 @@ mod match_request_integration_tests {
             status: RequestStatus::Pending,
             assigned_units: soroban_sdk::Vec::new(env),
             fulfilled_quantity_ml: 0,
+            reservation_id: None,
+            fulfilled_by: None,
+            history: soroban_sdk::Vec::new(env),
         }
     }
 
@@ -751,7 +754,7 @@ mod match_request_integration_tests {
 mod match_multiple_requests_integration_tests {
     use soroban_sdk::{testutils::Address as _, Address, Env};
 
-    use crate::{Urgency, MatchingContract, MatchingContractClient};
+    use crate::{MatchingContract, MatchingContractClient, Urgency};
 
     fn setup<'a>() -> (Env, MatchingContractClient<'a>, Address, Address, Address) {
         let env = Env::default();
@@ -801,6 +804,45 @@ mod match_multiple_requests_integration_tests {
             ids.push_back(i + 1);
         }
         let result = client.try_match_multiple_requests(&ids);
-        assert_eq!(result, Ok(Err(MatchingError::BatchTooLarge)));
+        // A contract error surfaces as Err(Ok(error)) from the generated try_ client.
+        assert_eq!(result.err(), Some(Ok(MatchingError::BatchTooLarge)));
+    }
+}
+
+/// #1453: the mirrored BloodRequest must decode a request returned by the
+/// real requests contract, which carries reservation_id / fulfilled_by /
+/// history. A missing field makes every cross-contract get_request fail.
+#[cfg(test)]
+mod request_mirror {
+    use crate::types::RequestStatus;
+    use crate::RequestsContractClient;
+    use request_contract::{
+        BloodComponent, BloodType, RequestContract, RequestContractClient, Urgency,
+    };
+    use soroban_sdk::{testutils::Address as _, Address, Env};
+
+    #[test]
+    fn mirror_decodes_live_request() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let requests_id = env.register(RequestContract, ());
+        let requests = RequestContractClient::new(&env, &requests_id);
+        requests.initialize(&Address::generate(&env), &Address::generate(&env));
+        let hospital = Address::generate(&env);
+        requests.authorize_hospital(&hospital);
+        let request_id = requests.create_request(
+            &hospital,
+            &BloodType::APositive,
+            &BloodComponent::WholeBlood,
+            &450u32,
+            &Urgency::Urgent,
+            &(env.ledger().timestamp() + 3_600),
+        );
+
+        let mirrored = RequestsContractClient::new(&env, &requests_id).get_request(&request_id);
+        assert_eq!(mirrored.id, request_id);
+        assert_eq!(mirrored.status, RequestStatus::Pending);
+        assert_eq!(mirrored.quantity_ml, 450);
+        assert_eq!(mirrored.fulfilled_by, None);
     }
 }

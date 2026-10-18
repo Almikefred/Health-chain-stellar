@@ -368,7 +368,7 @@ impl RequestContract {
 
         // Authorized riders may only drive the Approved → InProgress transition (pickup);
         // all other transitions remain admin-only.
-        if !is_admin && !(new_status == RequestStatus::InProgress && is_authorized_rider) {
+        if !(is_admin || (new_status == RequestStatus::InProgress && is_authorized_rider)) {
             return Err(ContractError::Unauthorized);
         }
 
@@ -419,7 +419,10 @@ impl RequestContract {
             released_reservation,
         );
         storage::set_request(&env, &request);
-        if matches!(new_status, RequestStatus::Rejected | RequestStatus::Fulfilled) {
+        if matches!(
+            new_status,
+            RequestStatus::Rejected | RequestStatus::Fulfilled
+        ) {
             storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
         }
 

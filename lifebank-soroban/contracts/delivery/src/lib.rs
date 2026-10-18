@@ -302,6 +302,30 @@ impl DeliveryContract {
             return Err(Error::NotInitialized);
         }
 
+        // Delivery ids mirror request ids, which start at 1. Reject anything
+        // the request contract has never issued so an attestation cannot
+        // squat on an id that does not exist yet.
+        if delivery_id == 0 {
+            return Err(Error::DeliveryNotFound);
+        }
+
+        let request_contract = Self::get_request_contract(env.clone())?;
+        let request_counter = RequestContractClient::new(&env, &request_contract)
+            .try_get_request_counter()
+            .map_err(|_| Error::DeliveryNotFound)?
+            .map_err(|_| Error::DeliveryNotFound)?;
+
+        if delivery_id > request_counter {
+            return Err(Error::DeliveryNotFound);
+        }
+
+        let stored_counter = Self::get_delivery_counter(env.clone())?;
+        if request_counter > stored_counter {
+            env.storage()
+                .instance()
+                .set(&DataKey::DeliveryCounter, &request_counter);
+        }
+
         let attestation_key = DataKey::ComplianceAttestation(delivery_id);
         if env.storage().persistent().has(&attestation_key) {
             return Err(Error::AlreadyAttested);

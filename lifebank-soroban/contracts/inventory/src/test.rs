@@ -1,8 +1,8 @@
 use crate::storage;
 use crate::types::{BloodStatus, BloodType};
-use crate::{InventoryContract, InventoryContractClient};
+use crate::{ContractError, InventoryContract, InventoryContractClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger},
+    testutils::{Address as _, Ledger},
     vec, Address, Env, String,
 };
 
@@ -34,7 +34,7 @@ fn test_initialize_success() {
 }
 
 #[test]
-fn test_invalid_status_transition_emits_event_without_changing_status() {
+fn test_invalid_status_transition_is_rejected_without_changing_status() {
     let (env, admin, client, _) = create_test_contract();
     env.ledger().set_timestamp(1000u64);
     let unit_id = client.register_blood(
@@ -44,13 +44,18 @@ fn test_invalid_status_transition_emits_event_without_changing_status() {
         &450u32,
         &None,
     );
-    let events_before = env.events().all().len();
 
-    let result = client.update_status(&unit_id, &BloodStatus::Delivered, &admin, &None);
+    let result = client.try_update_status(&unit_id, &BloodStatus::Delivered, &admin, &None);
 
-    assert_eq!(result.status, BloodStatus::Available);
-    assert_eq!(client.get_blood_unit(&unit_id).status, BloodStatus::Available);
-    assert_eq!(env.events().all().len(), events_before + 1);
+    // BloodUnit has no PartialEq, so compare the error side only.
+    assert_eq!(
+        result.err(),
+        Some(Ok(ContractError::InvalidStatusTransition))
+    );
+    assert_eq!(
+        client.get_blood_unit(&unit_id).status,
+        BloodStatus::Available
+    );
 }
 
 #[test]
@@ -2322,7 +2327,6 @@ fn test_release_reservation_by_contract_releases_reservation() {
     env.ledger().set_timestamp(1000u64);
 
     let bank = admin.clone();
-    let hospital = Address::generate(&env);
 
     // Register a blood unit
     let unit_id = client.register_blood(
@@ -2342,6 +2346,7 @@ fn test_release_reservation_by_contract_releases_reservation() {
 
     // Register the trusted requests contract address, then release via it.
     let authorized_addr = Address::generate(&env);
+    client.set_requests_contract(&admin, &authorized_addr);
     client.release_reservation_by_contract(&authorized_addr, &reservation_id);
 
     // Verify unit is Available again
@@ -2361,5 +2366,7 @@ fn test_release_reservation_by_contract_fails_on_unknown_reservation() {
     let (env, admin, client, _) = create_test_contract();
     env.ledger().set_timestamp(1000u64);
 
-    client.release_reservation_by_contract(&Address::generate(&env), &999);
+    let trusted = Address::generate(&env);
+    client.set_requests_contract(&admin, &trusted);
+    client.release_reservation_by_contract(&trusted, &999);
 }

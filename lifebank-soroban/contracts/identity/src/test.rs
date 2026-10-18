@@ -100,7 +100,7 @@ fn test_register_organization() {
     assert_eq!(org.name, name);
     assert_eq!(org.license_number, license);
     assert_eq!(org.org_type, OrgType::BloodBank);
-    assert_eq!(org.verified, false);
+    assert!(!org.verified);
 
     let role = client.get_role(&org_id).unwrap();
     assert_eq!(role, Role::BloodBank);
@@ -262,8 +262,101 @@ fn test_get_verified_organizations() {
         &vec![&env],
     );
 
-    let verified = client.get_verified_organizations(&OrgType::BloodBank, &10);
-    assert_eq!(verified.len(), 0);
+    let verified = client.get_verified_organizations(&OrgType::BloodBank, &0, &10);
+    assert_eq!(verified.items.len(), 0);
+    assert_eq!(verified.next_start, None);
+}
+
+/// #1450: re-registering the same owner must not overwrite the organization,
+/// duplicate it in the type index, or bump the counter.
+#[test]
+fn test_register_organization_rejects_existing_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(IdentityContract, ());
+    let client = IdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let loc = BytesN::from_array(&env, &[0u8; 32]);
+
+    let owner = Address::generate(&env);
+    client.register_organization(
+        &owner,
+        &OrgType::BloodBank,
+        &String::from_str(&env, "BB1"),
+        &String::from_str(&env, "LIC-1"),
+        &loc,
+        &vec![&env],
+    );
+    client.verify_organization(&admin, &owner);
+
+    let result = client.try_register_organization(
+        &owner,
+        &OrgType::Hospital,
+        &String::from_str(&env, "Renamed"),
+        &String::from_str(&env, "LIC-2"),
+        &loc,
+        &vec![&env],
+    );
+    assert_eq!(result, Err(Ok(Error::OrganizationAlreadyRegistered)));
+
+    let org = client.get_organization(&owner).unwrap();
+    assert_eq!(org.name, String::from_str(&env, "BB1"));
+    assert!(org.verified);
+    assert_eq!(
+        client
+            .get_organizations_by_type(&OrgType::BloodBank, &10)
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .get_organizations_by_type(&OrgType::Hospital, &10)
+            .len(),
+        0
+    );
+}
+
+/// #1451: get_verified_organizations scans a bounded window and hands back a
+/// cursor, so callers can walk a list of any size.
+#[test]
+fn test_get_verified_organizations_is_paginated() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().budget().reset_unlimited();
+    let contract_id = env.register(IdentityContract, ());
+    let client = IdentityContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let loc = BytesN::from_array(&env, &[0u8; 32]);
+
+    // 250 unverified orgs, then one verified one past the scan window.
+    for i in 0..251u32 {
+        let owner = Address::generate(&env);
+        let mut lic = [b'L'; 8];
+        lic[5] = b'0' + (i / 100) as u8;
+        lic[6] = b'0' + ((i / 10) % 10) as u8;
+        lic[7] = b'0' + (i % 10) as u8;
+        client.register_organization(
+            &owner,
+            &OrgType::BloodBank,
+            &String::from_str(&env, "BB"),
+            &String::from_bytes(&env, &lic),
+            &loc,
+            &vec![&env],
+        );
+        if i == 250 {
+            client.verify_organization(&admin, &owner);
+        }
+    }
+
+    let first = client.get_verified_organizations(&OrgType::BloodBank, &0, &10);
+    assert_eq!(first.items.len(), 0);
+    assert_eq!(first.next_start, Some(200));
+
+    let second = client.get_verified_organizations(&OrgType::BloodBank, &200, &10);
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.next_start, None);
 }
 
 #[test]
@@ -303,7 +396,7 @@ fn test_verify_organization() {
     assert_eq!(event_topic, Symbol::new(&env, "org_verified"));
 
     let org = client.get_organization(&org_id).unwrap();
-    assert_eq!(org.verified, true);
+    assert!(org.verified);
     assert!(org.verified_timestamp.is_some());
 }
 
@@ -427,7 +520,7 @@ fn test_unverify_organization() {
     assert_eq!(event_topic, Symbol::new(&env, "org_unverified"));
 
     let org = client.get_organization(&org_id).unwrap();
-    assert_eq!(org.verified, false);
+    assert!(!org.verified);
     assert!(org.verified_timestamp.is_none());
 }
 
@@ -1389,19 +1482,19 @@ fn test_storage_benchmark_comparison() {
     client.grant_role_with_expiry(&addr5, &Role::BloodBank, &None);
 
     let mut storage_entry_count = 0;
-    if client.get_roles(&addr1).len() > 0 {
+    if !client.get_roles(&addr1).is_empty() {
         storage_entry_count += 1;
     }
-    if client.get_roles(&addr2).len() > 0 {
+    if !client.get_roles(&addr2).is_empty() {
         storage_entry_count += 1;
     }
-    if client.get_roles(&addr3).len() > 0 {
+    if !client.get_roles(&addr3).is_empty() {
         storage_entry_count += 1;
     }
-    if client.get_roles(&addr4).len() > 0 {
+    if !client.get_roles(&addr4).is_empty() {
         storage_entry_count += 1;
     }
-    if client.get_roles(&addr5).len() > 0 {
+    if !client.get_roles(&addr5).is_empty() {
         storage_entry_count += 1;
     }
 
