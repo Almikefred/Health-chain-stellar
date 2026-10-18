@@ -1355,3 +1355,4 @@ impl AccessControlContract {
 }
 
 mod test;
+mod test_verification;

@@ -186,7 +186,7 @@ impl MockPaymentContract {
     }
 
     /// Called by the coordinator in settle_payment (→ Released) and rollback (→ Refunded).
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) {
+    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus, _caller: Address) {
         let mut p: Payment = env
             .storage()
             .persistent()
