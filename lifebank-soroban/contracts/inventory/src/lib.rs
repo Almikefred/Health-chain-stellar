@@ -169,17 +169,33 @@ impl InventoryContract {
         if admin != stored_admin {
             return Err(ContractError::Unauthorized);
         }
-        let role_key = DataKey::Role(grantee);
+        let role_key = DataKey::Role(grantee.clone());
         env.storage().persistent().set(&role_key, &role);
         env.storage().persistent().extend_ttl(
             &role_key,
             storage::TTL_THRESHOLD,
             storage::TTL_EXTEND_TO,
         );
+        events::emit_role_granted(&env, &grantee, role, &admin);
+        Ok(())
+    }
+
+    /// Revoke an address's role. Admin only.
+    pub fn revoke_role(env: Env, admin: Address, grantee: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        let stored_admin = storage::get_admin(&env);
+        if admin != stored_admin {
+            return Err(ContractError::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Role(grantee.clone()));
+        events::emit_role_revoked(&env, &grantee, &admin);
         Ok(())
     }
 
     /// Get the role of an address. Returns Admin if address is contract admin, otherwise retrieves stored role.
+    /// Addresses without a stored role are `Unprivileged`.
     fn get_role(env: &Env, address: &Address) -> Role {
         let admin = storage::get_admin(env);
         if address == &admin {
@@ -188,7 +204,7 @@ impl InventoryContract {
             env.storage()
                 .persistent()
                 .get(&DataKey::Role(address.clone()))
-                .unwrap_or(Role::BloodBank)
+                .unwrap_or(Role::Unprivileged)
         }
     }
 
@@ -211,6 +227,7 @@ impl InventoryContract {
                 }
             }
             Role::BloodBank => Ok(()),
+            Role::Unprivileged => Err(ContractError::InsufficientRolePermission),
         }
     }
 
@@ -493,7 +510,12 @@ impl InventoryContract {
 
         let blood_unit = storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
 
-        let role = Self::get_role(&env, &authorized_by);
+        // The owning blood bank acts with the implicit BloodBank role unless a
+        // different role was explicitly stored for it.
+        let role = match Self::get_role(&env, &authorized_by) {
+            Role::Unprivileged if authorized_by == blood_unit.bank_id => Role::BloodBank,
+            role => role,
+        };
         Self::assert_can_transition(&role, &new_status)?;
 
         // Allow the transition when:

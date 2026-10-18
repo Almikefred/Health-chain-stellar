@@ -259,6 +259,8 @@ pub enum Role {
     Rider,
     /// Hospital staff - can mark units as Delivered
     Hospital,
+    /// No role assigned (default for unknown addresses) - cannot transition any unit
+    Unprivileged,
 }
 
 /// Storage key types for efficient querying
