@@ -69,6 +69,7 @@ pub struct InventoryContract;
 #[contractimpl]
 impl InventoryContract {
     const MAX_RESERVATION_DURATION_SECS: u64 = 86_400 * 7;
+    const MAX_BATCH_SIZE: u32 = 50;
     const CONTRACT_VERSION: u32 = 1;
 
     /// Initialize the inventory contract
@@ -640,12 +641,24 @@ impl InventoryContract {
 
         Self::require_not_paused(&env)?;
 
+        if unit_ids.len() > Self::MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
+
         let admin = storage::get_admin(&env);
         let current_time = env.ledger().timestamp();
 
         // 1. Validate all units first (atomicity)
+        // Track seen unit IDs so a duplicate can't pass validation against the
+        // stored status and then record a bogus X→X transition in the update pass.
+        let mut seen_units = Map::<u64, bool>::new(&env);
         for i in 0..unit_ids.len() {
             let unit_id = unit_ids.get(i).ok_or(ContractError::NotFound)?;
+            if seen_units.contains_key(unit_id) {
+                return Err(ContractError::DuplicateBloodUnit);
+            }
+            seen_units.set(unit_id, true);
+
             let blood_unit =
                 storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
 
