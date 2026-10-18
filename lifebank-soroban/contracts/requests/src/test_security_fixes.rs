@@ -88,7 +88,11 @@ fn test_cancel_request_by_owner_succeeds() {
     let (env, client, _admin, hospital) = setup_authorized_hospital();
     let request_id = create_urgent_request(&client, &hospital);
 
-    client.cancel_request(&hospital, &request_id, &String::from_str(&env, "owned cancel"));
+    client.cancel_request(
+        &hospital,
+        &request_id,
+        &String::from_str(&env, "owned cancel"),
+    );
 }
 
 /// #1151: Admin can cancel any request.
@@ -532,11 +536,7 @@ fn test_hospital_index_pruned_on_cancel() {
         &2_000u64,
     );
 
-    client.cancel_request(
-        &admin,
-        &req1,
-        &String::from_str(&env, "no longer needed"),
-    );
+    client.cancel_request(&admin, &req1, &String::from_str(&env, "no longer needed"));
 
     let results = client.get_requests_by_hospital(&hospital, &0u32, &10u32);
     assert_eq!(results.len(), 1);

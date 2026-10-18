@@ -7,7 +7,7 @@ struct MockRequestContract;
 
 #[contractimpl]
 impl MockRequestContract {
-    fn get_request_counter(_env: Env) -> u64 {
+    pub fn get_request_counter(_env: Env) -> u64 {
         100
     }
 }
@@ -127,7 +127,7 @@ fn test_record_compliance_attestation_succeeds() {
     assert!(result.is_ok());
 
     let events = env.events().all();
-    assert!(events.len() >= 1);
+    assert!(!events.is_empty());
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn test_get_compliance_attestation_roundtrip() {
 
     let (retrieved_hash, is_compliant) = client.get_compliance_attestation(&delivery_id);
     assert_eq!(retrieved_hash, compliance_hash);
-    assert_eq!(is_compliant, false);
+    assert!(!is_compliant);
 }
 
 #[test]

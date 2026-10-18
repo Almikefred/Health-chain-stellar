@@ -9,9 +9,8 @@
 //!   rollback with unlocked payment                       (idempotent refund guard)
 //!
 //! Why mocks instead of real contracts?
-//! The coordinator defines minimal proxy types (`BloodRequest {id, status}`,
-//! `BloodUnit {id, status}`, `Payment {id, request_id, status}`) that share only
-//! the fields it cares about. The real domain contracts use richer structs whose
+//! The coordinator defines minimal proxy types (`BloodRequest {id, blood_type, status}`,
+//! `BloodUnit {id, status, blood_type}`) that share only the fields it cares about. The real domain contracts use richer structs whose
 //! XDR encoding is incompatible with the coordinator's cross-contract client
 //! expectations. Mocks mirror the coordinator's type definitions exactly, keeping
 //! these tests focused on coordinator orchestration and cross-contract state.
@@ -24,6 +23,10 @@ use coordinator_contract::{
     BloodRequest, BloodStatus, BloodType, BloodUnit, CoordinatorContract,
     CoordinatorContractClient, CoordinatorError, Payment, PaymentStatus, RequestStatus,
     WorkflowRecord, WorkflowStatus,
+};
+use temperature_contract::{
+    ExcursionSummary as TemperatureExcursionSummary, TemperatureContract,
+    TemperatureContractClient,
 };
 
 // ── Mock: Requests contract ───────────────────────────────────────────────────
@@ -42,7 +45,14 @@ impl MockRequestContract {
     pub fn seed_request(env: Env, id: u64, status: RequestStatus) {
         env.storage()
             .persistent()
-            .set(&ReqKey::Request(id), &BloodRequest { id, status });
+            .set(
+                &ReqKey::Request(id),
+                &BloodRequest {
+                    id,
+                    blood_type: BloodType::OPositive,
+                    status,
+                },
+            );
     }
 
     /// Called by the coordinator to check request status before allocating.
@@ -88,14 +98,18 @@ impl MockInventoryContract {
             .unwrap_or(0u64)
             + 1;
         env.storage().instance().set(&InvKey::Counter, &id);
-        env.storage().persistent().set(
-            &InvKey::Unit(id),
-            &BloodUnit {
-                id,
-                status: BloodStatus::Available,
-                blood_type: coordinator_contract::BloodType::OPositive,
-            },
-        );
+        let unit = BloodUnit {
+            id,
+            blood_type: coordinator_contract::BloodType::OPositive,
+            quantity_ml: 450,
+            bank_id: env.current_contract_address(),
+            donor_id: None,
+            donation_timestamp: 0,
+            expiration_timestamp: 10_000_000,
+            status: BloodStatus::Available,
+            metadata: soroban_sdk::Map::new(&env),
+        };
+        env.storage().persistent().set(&InvKey::Unit(id), &unit);
         id
     }
 
@@ -171,7 +185,16 @@ impl MockPaymentContract {
             &Payment {
                 id,
                 request_id,
+                payer: env.current_contract_address(),
+                payee: env.current_contract_address(),
+                amount: 100,
                 status,
+                created_at: 0,
+                updated_at: 0,
+                dispute_reason_code: None,
+                dispute_case_id: None,
+                dispute_resolved: false,
+                token: None,
             },
         );
         id
@@ -186,13 +209,49 @@ impl MockPaymentContract {
     }
 
     /// Called by the coordinator in settle_payment (→ Released) and rollback (→ Refunded).
-    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus) {
+    pub fn update_status(env: Env, payment_id: u64, status: PaymentStatus, _caller: Address) {
         let mut p: Payment = env
             .storage()
             .persistent()
             .get(&PayKey::Payment(payment_id))
             .expect("payment not found");
         p.status = status;
+        env.storage()
+            .persistent()
+            .set(&PayKey::Payment(payment_id), &p);
+    }
+
+    /// Called by the coordinator in rollback / expire_workflow (→ Refunded).
+    /// Only a Locked payment holds refundable funds, matching the real
+    /// payments contract's `refund_escrow` precondition.
+    pub fn refund_escrow(env: Env, _caller: Address, payment_id: u64) {
+        let mut p: Payment = env
+            .storage()
+            .persistent()
+            .get(&PayKey::Payment(payment_id))
+            .expect("payment not found");
+        if p.status == PaymentStatus::Locked {
+            p.status = PaymentStatus::Refunded;
+        }
+        env.storage()
+            .persistent()
+            .set(&PayKey::Payment(payment_id), &p);
+    }
+
+    /// Called by the coordinator when a temperature excursion is escalated.
+    pub fn record_dispute(
+        env: Env,
+        payment_id: u64,
+        _reason: coordinator_contract::DisputeReason,
+        _case_id: String,
+        _caller: Address,
+    ) {
+        let mut p: Payment = env
+            .storage()
+            .persistent()
+            .get(&PayKey::Payment(payment_id))
+            .expect("payment not found");
+        p.status = PaymentStatus::Disputed;
         env.storage()
             .persistent()
             .set(&PayKey::Payment(payment_id), &p);
@@ -288,7 +347,6 @@ fn test_full_allocation_to_delivery_workflow() {
         &units,
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     // Workflow record should be Allocated.
@@ -399,7 +457,6 @@ fn test_rollback_releases_inventory_and_refunds_payment() {
         &units,
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     assert_eq!(get_unit(&h, unit_a).status, BloodStatus::Reserved);
@@ -465,7 +522,6 @@ fn test_rollback_with_pending_payment_does_not_refund() {
         &vec![&h.env, unit_id],
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     assert_eq!(get_unit(&h, unit_id).status, BloodStatus::Reserved);
@@ -513,7 +569,6 @@ fn test_settle_without_confirm_delivery_is_rejected() {
         &vec![&h.env, unit_id],
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
 
     // Skip confirm_delivery — settle must fail.
@@ -547,7 +602,6 @@ fn test_rollback_after_settlement_is_rejected() {
         &vec![&h.env, unit_id],
         &payment_id,
         &h.admin,
-        &BloodType::OPositive,
     );
     h.coord.confirm_delivery(
         &request_id,
@@ -561,5 +615,66 @@ fn test_rollback_after_settlement_is_rejected() {
         result,
         Err(Ok(CoordinatorError::CannotRollbackSettled)),
         "rollback must fail with CannotRollbackSettled on a settled workflow"
+    );
+}
+
+// ── Integration test 4: temperature excursion escalates to a payment dispute ──
+
+/// Registers the **real** temperature and coordinator contracts together with a
+/// mock payments contract, then drives a sustained cold-chain excursion through
+/// `temperature.report_excursion_to_coordinator`. The coordinator must accept
+/// the call from the configured oracle and move the linked `Locked` escrow to
+/// `Disputed` (issue #1615).
+#[test]
+fn test_temperature_excursion_disputes_locked_payment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let req_id = env.register(MockRequestContract, ());
+    let inv_id = env.register(MockInventoryContract, ());
+    let pay_id = env.register(MockPaymentContract, ());
+    let coord_id = env.register(CoordinatorContract, ());
+    let temp_id = env.register(TemperatureContract, ());
+
+    MockInventoryContractClient::new(&env, &inv_id).initialize(&admin);
+
+    // ── Coordinator: addresses + the one oracle address it trusts ────────────
+    let coord = CoordinatorContractClient::new(&env, &coord_id);
+    coord.initialize(&admin, &req_id, &inv_id, &pay_id);
+    coord.set_temperature_oracle(&admin, &oracle);
+
+    // ── Temperature: wire the coordinator and whitelist the oracle ───────────
+    let temp = TemperatureContractClient::new(&env, &temp_id);
+    temp.initialize(&admin);
+    temp.set_coordinator(&admin, &coord_id);
+    temp.add_oracle(&admin, &oracle);
+
+    // ── Drive a sustained excursion (3 consecutive violations) ───────────────
+    let unit_id = 42u64;
+    temp.set_threshold(&admin, &unit_id, &200, &600); // 2.00°C .. 6.00°C
+    temp.log_reading(&oracle, &unit_id, &1200); // 12.00°C — violation
+    temp.log_reading(&oracle, &unit_id, &1200);
+    temp.log_reading(&oracle, &unit_id, &1200);
+
+    let payment_id = MockPaymentContractClient::new(&env, &pay_id)
+        .seed_payment(&1u64, &PaymentStatus::Locked);
+
+    let excursion = TemperatureExcursionSummary {
+        unit_id,
+        violation_count: 3,
+        peak_celsius_x100: 1200,
+        detected_at: 0,
+    };
+    temp.report_excursion_to_coordinator(&oracle, &unit_id, &payment_id, &excursion);
+
+    assert_eq!(
+        MockPaymentContractClient::new(&env, &pay_id)
+            .get_payment(&payment_id)
+            .status,
+        PaymentStatus::Disputed,
+        "a sustained excursion must move the locked escrow to Disputed"
     );
 }

@@ -433,5 +433,5 @@ fn test_cancel_request_with_reservation_id() {
 
     let history = client.get_request_history(&request_id);
     let cancel_entry = history.get(3).unwrap();
-    assert_eq!(cancel_entry.released_reservation, true);
+    assert!(cancel_entry.released_reservation);
 }

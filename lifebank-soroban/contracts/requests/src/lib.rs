@@ -323,6 +323,62 @@ impl RequestContract {
             return Err(ContractError::NotRequestOwner);
         }
 
+        Self::cancel_internal(&env, &mut request, &caller, reason)
+    }
+
+    /// Configure the payments contract trusted to cancel requests via
+    /// `cancel_request_by_contract`. Admin only; may be called again to rotate.
+    pub fn set_payments_contract(
+        env: Env,
+        payments_contract: Address,
+    ) -> Result<(), ContractError> {
+        storage::require_initialized(&env)?;
+        storage::get_admin(&env).require_auth();
+        storage::set_payments_contract(&env, &payments_contract);
+        events::emit_payments_contract_set(&env, &payments_contract);
+        Ok(())
+    }
+
+    pub fn get_payments_contract(env: Env) -> Result<Option<Address>, ContractError> {
+        storage::require_initialized(&env)?;
+        Ok(storage::get_payments_contract(&env))
+    }
+
+    /// Cancel a blood request on behalf of the trusted payments contract
+    /// (e.g. after an expired dispute is auto-refunded).
+    ///
+    /// Mirrors inventory's `release_reservation_by_contract`: `caller_contract`
+    /// must authorize the call (automatic for the direct invoking contract) and
+    /// must equal the payments contract configured via `set_payments_contract`.
+    pub fn cancel_request_by_contract(
+        env: Env,
+        caller_contract: Address,
+        request_id: u64,
+        reason: String,
+    ) -> Result<(), ContractError> {
+        storage::require_initialized(&env)?;
+        caller_contract.require_auth();
+
+        match storage::get_payments_contract(&env) {
+            Some(ref trusted) if *trusted == caller_contract => {}
+            Some(_) => return Err(ContractError::Unauthorized),
+            None => return Err(ContractError::PaymentsContractNotSet),
+        }
+
+        Self::ensure_non_empty_reason(&reason)?;
+
+        let mut request =
+            storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
+
+        Self::cancel_internal(&env, &mut request, &caller_contract, reason)
+    }
+
+    fn cancel_internal(
+        env: &Env,
+        request: &mut BloodRequest,
+        actor: &Address,
+        reason: String,
+    ) -> Result<(), ContractError> {
         match request.status {
             RequestStatus::Pending | RequestStatus::Approved | RequestStatus::InProgress => {}
             _ => return Err(ContractError::InvalidRequestStatus),
@@ -330,11 +386,11 @@ impl RequestContract {
 
         let old_status = request.status;
         request.status = RequestStatus::Cancelled;
-        let released_reservation = Self::release_reservation_if_present(&env, &mut request);
+        let released_reservation = Self::release_reservation_if_present(env, request);
         Self::append_history(
-            &env,
-            &mut request,
-            &caller,
+            env,
+            request,
+            actor,
             old_status,
             false,
             RequestStatus::Cancelled,
@@ -342,10 +398,10 @@ impl RequestContract {
             0,
             released_reservation,
         );
-        storage::set_request(&env, &request);
-        storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
+        storage::set_request(env, request);
+        storage::remove_from_hospital_requests(env, &request.hospital_id, request.id);
 
-        events::emit_request_cancelled(&env, request_id, &caller, env.ledger().timestamp());
+        events::emit_request_cancelled(env, request.id, actor, env.ledger().timestamp());
 
         Ok(())
     }
@@ -368,7 +424,7 @@ impl RequestContract {
 
         // Authorized riders may only drive the Approved → InProgress transition (pickup);
         // all other transitions remain admin-only.
-        if !is_admin && !(new_status == RequestStatus::InProgress && is_authorized_rider) {
+        if !(is_admin || (new_status == RequestStatus::InProgress && is_authorized_rider)) {
             return Err(ContractError::Unauthorized);
         }
 
@@ -419,7 +475,10 @@ impl RequestContract {
             released_reservation,
         );
         storage::set_request(&env, &request);
-        if matches!(new_status, RequestStatus::Rejected | RequestStatus::Fulfilled) {
+        if matches!(
+            new_status,
+            RequestStatus::Rejected | RequestStatus::Fulfilled
+        ) {
             storage::remove_from_hospital_requests(&env, &request.hospital_id, request_id);
         }
 

@@ -7,9 +7,9 @@ mod types;
 
 use crate::error::ContractError;
 use crate::types::{
-    DataKey, ExcursionSummary, PendingThresholdChange, TemperatureReading, TemperatureSummary,
-    TemperatureThreshold,
+    DataKey, PendingThresholdChange, TemperatureReading, TemperatureSummary, TemperatureThreshold,
 };
+pub use types::ExcursionSummary;
 use soroban_sdk::{contract, contractclient, contractevent, contractimpl, Address, Env, Vec};
 
 #[contractevent(topics = ["threshold", "proposed"], data_format = "vec")]
@@ -64,6 +64,12 @@ const PAGE_SIZE: u32 = 20;
 /// blood-storage or ambient sensor reading.
 const MIN_PLAUSIBLE_TEMP_CELSIUS_X100: i32 = -27315;
 const MAX_PLAUSIBLE_TEMP_CELSIUS_X100: i32 = 8500;
+/// Bounds for a configured storage threshold (x100 Celsius). -90°C covers
+/// ultra-low plasma freezers; +40°C is well above platelet storage (20-24°C).
+/// A threshold outside this band would never fire for any real reading,
+/// silently disabling cold-chain monitoring for the unit.
+const MIN_THRESHOLD_CELSIUS_X100: i32 = -9000;
+const MAX_THRESHOLD_CELSIUS_X100: i32 = 4000;
 const CONTRACT_VERSION: u32 = 1;
 const GOVERNANCE_DELAY_SECONDS: u64 = 7 * 24 * 3600;
 /// TTL constants for persistent oracle approval entries (in ledgers; ~5 s each).
@@ -115,7 +121,8 @@ impl TemperatureContract {
     ///
     /// # Errors
     /// - `Unauthorized`: Caller is not the admin
-    /// - `InvalidThreshold`: Min >= Max
+    /// - `ContractPaused`: Contract is paused
+    /// - `InvalidThreshold`: Min >= Max, or either bound outside the allowed band
     pub fn propose_threshold_change(
         env: Env,
         admin: Address,
@@ -124,6 +131,7 @@ impl TemperatureContract {
         max_celsius_x100: i32,
     ) -> Result<(), ContractError> {
         admin.require_auth();
+        Self::require_not_paused(&env)?;
         // Verify the caller is the stored admin, not just that they signed
         // their own address.  Without this check any address can pass itself
         // as `admin`, satisfy require_auth(), and propose arbitrary threshold
@@ -132,9 +140,7 @@ impl TemperatureContract {
         if admin != stored_admin {
             return Err(ContractError::Unauthorized);
         }
-        if min_celsius_x100 >= max_celsius_x100 {
-            return Err(ContractError::InvalidThreshold);
-        }
+        Self::validate_threshold(min_celsius_x100, max_celsius_x100)?;
 
         let effective_at = env.ledger().timestamp() + GOVERNANCE_DELAY_SECONDS;
         let pending_change = PendingThresholdChange {
@@ -181,9 +187,12 @@ impl TemperatureContract {
     /// * `unit_id` - Blood unit ID for which to apply the threshold change
     ///
     /// # Errors
+    /// - `ContractPaused`: Contract is paused
     /// - `NoPendingChange`: No pending change exists for this unit
     /// - `ChangeNotReady`: Time-lock period has not elapsed yet
+    /// - `InvalidThreshold`: The pending change is outside the allowed band
     pub fn apply_threshold_change(env: Env, unit_id: u64) -> Result<(), ContractError> {
+        Self::require_not_paused(&env)?;
         let pending_change: PendingThresholdChange = env
             .storage()
             .persistent()
@@ -194,6 +203,12 @@ impl TemperatureContract {
         if current_time < pending_change.effective_at {
             return Err(ContractError::ChangeNotReady);
         }
+        // Re-check at apply time: a proposal stored before the bounds existed
+        // must not bypass them.
+        Self::validate_threshold(
+            pending_change.new_min_celsius_x100,
+            pending_change.new_max_celsius_x100,
+        )?;
 
         // Apply the threshold change
         let threshold = TemperatureThreshold {
@@ -247,6 +262,19 @@ impl TemperatureContract {
             .unwrap_or(false)
     }
 
+    fn validate_threshold(
+        min_celsius_x100: i32,
+        max_celsius_x100: i32,
+    ) -> Result<(), ContractError> {
+        if min_celsius_x100 >= max_celsius_x100
+            || min_celsius_x100 < MIN_THRESHOLD_CELSIUS_X100
+            || max_celsius_x100 > MAX_THRESHOLD_CELSIUS_X100
+        {
+            return Err(ContractError::InvalidThreshold);
+        }
+        Ok(())
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), ContractError> {
         if env
             .storage()
@@ -274,9 +302,7 @@ impl TemperatureContract {
             return Err(ContractError::Unauthorized);
         }
 
-        if min_celsius_x100 >= max_celsius_x100 {
-            return Err(ContractError::InvalidThreshold);
-        }
+        Self::validate_threshold(min_celsius_x100, max_celsius_x100)?;
 
         let threshold = TemperatureThreshold {
             min_celsius_x100,
@@ -366,9 +392,11 @@ impl TemperatureContract {
         if new_streak >= 3 {
             let compromised_key = DataKey::IsCompromised(unit_id);
             env.storage().persistent().set(&compromised_key, &true);
-            env.storage()
-                .persistent()
-                .extend_ttl(&compromised_key, ORACLE_BUMP_THRESHOLD, ORACLE_BUMP_TO);
+            env.storage().persistent().extend_ttl(
+                &compromised_key,
+                ORACLE_BUMP_THRESHOLD,
+                ORACLE_BUMP_TO,
+            );
         }
 
         // Use the cached "current page" cursor so insertion is O(1) instead
@@ -566,9 +594,11 @@ impl TemperatureContract {
         let streak_key = DataKey::ConsecutiveViolationStreak(unit_id);
         let streak = env.storage().persistent().get(&streak_key).unwrap_or(0);
         if streak > 0 {
-            env.storage()
-                .persistent()
-                .extend_ttl(&streak_key, ORACLE_BUMP_THRESHOLD, ORACLE_BUMP_TO);
+            env.storage().persistent().extend_ttl(
+                &streak_key,
+                ORACLE_BUMP_THRESHOLD,
+                ORACLE_BUMP_TO,
+            );
         }
         streak
     }
@@ -582,14 +612,17 @@ impl TemperatureContract {
     /// `true` if unit has 3 or more consecutive violations (compromised), `false` otherwise
     pub fn is_compromised(env: Env, unit_id: u64) -> bool {
         let compromised_key = DataKey::IsCompromised(unit_id);
-        let is_compromised = env.storage()
+        let is_compromised = env
+            .storage()
             .persistent()
             .get(&compromised_key)
             .unwrap_or(false);
         if is_compromised {
-            env.storage()
-                .persistent()
-                .extend_ttl(&compromised_key, ORACLE_BUMP_THRESHOLD, ORACLE_BUMP_TO);
+            env.storage().persistent().extend_ttl(
+                &compromised_key,
+                ORACLE_BUMP_THRESHOLD,
+                ORACLE_BUMP_TO,
+            );
         }
         is_compromised
     }
@@ -624,9 +657,11 @@ impl TemperatureContract {
             .extend_ttl(&streak_key, ORACLE_BUMP_THRESHOLD, ORACLE_BUMP_TO);
 
         env.storage().persistent().set(&compromised_key, &false);
-        env.storage()
-            .persistent()
-            .extend_ttl(&compromised_key, ORACLE_BUMP_THRESHOLD, ORACLE_BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &compromised_key,
+            ORACLE_BUMP_THRESHOLD,
+            ORACLE_BUMP_TO,
+        );
 
         CompromisedReset { unit_id }.publish(&env);
 
@@ -811,14 +846,13 @@ impl TemperatureContract {
         let mut peak_deviation: i32 = -1;
         let mut detected_at: u64 = 0;
 
-        let mut page_num: u32 = 0;
-        loop {
+        // Only the most recent pages are scanned (#1483): walking every page
+        // since the unit was registered grows without bound and eventually
+        // exceeds the instruction limit for long-monitored units.
+        let (first_page, last_page) = storage::get_excursion_scan_range(env, unit_id);
+        for page_num in first_page..=last_page {
             let page_len = storage::get_temp_page_len(env, unit_id, page_num);
-            if page_len == 0 && page_num > 0 {
-                break;
-            }
             if page_len == 0 {
-                page_num = page_num.saturating_add(1);
                 continue;
             }
 
@@ -843,8 +877,6 @@ impl TemperatureContract {
                     }
                 }
             }
-
-            page_num = page_num.saturating_add(1);
         }
 
         if violation_count == 0 {
@@ -1108,9 +1140,9 @@ mod tests {
 
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, _)| {
-            topics.iter().any(|t| {
-                Symbol::try_from_val(&env, &t) == Ok(Symbol::new(&env, "tmp_viol"))
-            })
+            topics
+                .iter()
+                .any(|t| Symbol::try_from_val(&env, &t) == Ok(Symbol::new(&env, "tmp_viol")))
         });
         assert!(found, "Expected a violation event to be published");
     }
@@ -1126,9 +1158,9 @@ mod tests {
 
         let events = env.events().all();
         let found = events.iter().any(|(_, topics, _)| {
-            topics.iter().any(|t| {
-                Symbol::try_from_val(&env, &t) == Ok(Symbol::new(&env, "tmp_viol"))
-            })
+            topics
+                .iter()
+                .any(|t| Symbol::try_from_val(&env, &t) == Ok(Symbol::new(&env, "tmp_viol")))
         });
         assert!(
             !found,
@@ -1178,9 +1210,9 @@ mod tests {
         let (_env, admin, oracle, client) = create_test_contract();
 
         let unit_id = 502u64;
-        client.set_threshold(&admin, &unit_id, &-27315, &8500);
+        client.set_threshold(&admin, &unit_id, &-9000, &4000);
 
-        // Boundary values should be accepted.
+        // Boundary values should be accepted (they are logged as violations).
         client.log_reading(&oracle, &unit_id, &-27315);
         client.log_reading(&oracle, &unit_id, &8500);
 
@@ -1236,7 +1268,7 @@ mod tests {
         let (_env, admin, oracle, client) = create_test_contract();
 
         let unit_id = 102u64;
-        client.set_threshold(&admin, &unit_id, &0, &8500);
+        client.set_threshold(&admin, &unit_id, &0, &4000);
 
         // Physically-plausible bounds now cap individual readings, so this
         // exercises the i64 accumulator with the maximum allowed magnitude
@@ -1263,7 +1295,8 @@ mod tests {
         // Verify min/max are correct
         assert_eq!(summary.min_celsius_x100, test_temp);
         assert_eq!(summary.max_celsius_x100, test_temp);
-        assert_eq!(summary.violation_count, 0);
+        // 85°C is above any allowed threshold, so every reading is a violation.
+        assert_eq!(summary.violation_count, num_readings as u32);
     }
 
     #[test]
@@ -1271,7 +1304,7 @@ mod tests {
         let (_env, admin, oracle, client) = create_test_contract();
 
         let unit_id = 103u64;
-        client.set_threshold(&admin, &unit_id, &-5000, &5000);
+        client.set_threshold(&admin, &unit_id, &-5000, &4000);
 
         // Test with extreme temperature values
         client.log_reading(&oracle, &unit_id, &-4000);
@@ -1719,5 +1752,63 @@ mod tests {
         client.log_reading(&sensor_b, &unit_id, &420);
         let readings = client.get_readings(&unit_id, &0u32, &100u32);
         assert_eq!(readings.len(), 3, "Should have 3 readings total");
+    }
+
+    // ── #1485 / #1486 regressions ─────────────────────────────────────────
+
+    /// #1485: pause must also freeze threshold governance, otherwise a paused
+    /// contract can still have its compliance bar moved.
+    #[test]
+    fn test_pause_blocks_threshold_governance() {
+        use soroban_sdk::testutils::Ledger as _;
+        let (env, admin, _oracle, client) = create_test_contract();
+        let unit_id = 7u64;
+        client.propose_threshold_change(&admin, &unit_id, &200, &600);
+
+        client.pause(&admin);
+        assert_eq!(
+            client.try_propose_threshold_change(&admin, &unit_id, &100, &500),
+            Err(Ok(ContractError::ContractPaused))
+        );
+        env.ledger()
+            .with_mut(|l| l.timestamp += GOVERNANCE_DELAY_SECONDS + 1);
+        assert_eq!(
+            client.try_apply_threshold_change(&unit_id),
+            Err(Ok(ContractError::ContractPaused))
+        );
+        assert!(client.get_pending_threshold_change(&unit_id).is_some());
+
+        client.unpause(&admin);
+        client.apply_threshold_change(&unit_id);
+        assert!(client.get_pending_threshold_change(&unit_id).is_none());
+    }
+
+    /// #1486: thresholds outside the allowed band are rejected on every path.
+    #[test]
+    fn test_threshold_bounds_enforced() {
+        let (_env, admin, _oracle, client) = create_test_contract();
+        let unit_id = 8u64;
+        let bad = [
+            (MIN_THRESHOLD_CELSIUS_X100 - 1, 600),
+            (200, MAX_THRESHOLD_CELSIUS_X100 + 1),
+            (i32::MIN, i32::MAX),
+            (600, 600),
+        ];
+        for (min, max) in bad {
+            assert_eq!(
+                client.try_set_threshold(&admin, &unit_id, &min, &max),
+                Err(Ok(ContractError::InvalidThreshold))
+            );
+            assert_eq!(
+                client.try_propose_threshold_change(&admin, &unit_id, &min, &max),
+                Err(Ok(ContractError::InvalidThreshold))
+            );
+        }
+        client.set_threshold(
+            &admin,
+            &unit_id,
+            &MIN_THRESHOLD_CELSIUS_X100,
+            &MAX_THRESHOLD_CELSIUS_X100,
+        );
     }
 }

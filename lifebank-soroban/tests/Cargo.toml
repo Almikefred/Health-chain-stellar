@@ -16,3 +16,4 @@ path = "integration_test.rs"
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 coordinator-contract = { path = "../contracts/coordinator" }
+temperature-contract = { path = "../contracts/temperature" }

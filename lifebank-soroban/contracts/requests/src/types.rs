@@ -21,6 +21,7 @@ pub enum DataKey {
     AuthorizedRider(Address),
     Request(u64),
     HospitalRequestIds(Address), // Maps hospital to Vec<u64> of request IDs
+    PaymentsContract,            // Trusted payments contract allowed to cancel requests
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
