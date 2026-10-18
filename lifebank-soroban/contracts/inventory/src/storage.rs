@@ -20,6 +20,10 @@ pub const LEDGER_CLOSE_SECS: u64 = 5;
 /// a few ledgers after creation and is readable in the same ledger batch.
 pub const RESERVATION_TTL_MIN_LEDGERS: u32 = 60; // ~5 minutes
 
+/// Grace period (ledgers) a reservation stays in storage after its expiry, so
+/// `expire_reservation` can return its units to `Available`. ~30 days.
+pub const RESERVATION_EXPIRY_GRACE_LEDGERS: u32 = 518_400;
+
 pub fn extend_instance_ttl(env: &Env) {
     env.storage()
         .instance()
@@ -494,21 +498,20 @@ pub fn increment_reservation_id(env: &Env) -> u64 {
     next_id
 }
 
-/// Store a reservation in temporary storage and extend its TTL to cover `duration_seconds`.
+/// Store a reservation in persistent storage and extend its TTL to cover
+/// `duration_seconds` plus a grace period.
+///
+/// # Why persistent storage
+/// Temporary entries are deleted permanently once their TTL lapses. If a reservation
+/// were purged, its unit IDs would be unrecoverable and the units would stay stuck in
+/// `Reserved` forever. Persistent entries survive past expiry, so `expire_reservation`
+/// can still find them and return the units to `Available`.
 ///
 /// # Why we extend TTL here
-/// Soroban temporary-storage entries are assigned a network-default TTL at creation
-/// time (currently ~1 ledger on testnet, a few ledgers on mainnet). That default is
-/// far shorter than the maximum reservation duration (7 days). Without an explicit
-/// bump the entry would be archived/purged long before it logically expires, causing
-/// `get_reservation` to return `None` and leaving all reserved units permanently
-/// stuck in `Reserved` status with no automated recovery path.
-///
-/// We convert `duration_seconds` to ledgers (ceiling division, rounding up) and
-/// apply a small safety buffer (`RESERVATION_TTL_BUFFER_LEDGERS`) so that the entry
-/// is still readable at the exact moment `expiration_timestamp` is reached.
-/// The threshold is set to the same value so the entry is bumped unconditionally
-/// (i.e., `extend_ttl` always sets the TTL to `ttl_ledgers`).
+/// The TTL covers the full reservation duration plus `RESERVATION_EXPIRY_GRACE_LEDGERS`
+/// so the entry is still readable after `expiration_timestamp` long enough for anyone
+/// to call `expire_reservation`. The threshold is set to the same value so the entry is
+/// bumped unconditionally (i.e., `extend_ttl` always sets the TTL to `ttl_ledgers`).
 pub fn set_reservation(
     env: &Env,
     id: u64,
@@ -516,28 +519,26 @@ pub fn set_reservation(
     duration_seconds: u64,
 ) {
     let key = DataKey::Reservation(id);
-    env.storage().temporary().set(&key, reservation);
+    env.storage().persistent().set(&key, reservation);
 
     // Convert duration to ledgers (ceiling division so we never under-extend).
-    // Add a small buffer so the entry remains readable at the exact expiry instant.
-    const BUFFER_LEDGERS: u32 = 120; // ~10 minutes of headroom
     let duration_ledgers =
         (duration_seconds.saturating_add(LEDGER_CLOSE_SECS - 1) / LEDGER_CLOSE_SECS) as u32;
     let ttl_ledgers = duration_ledgers
-        .saturating_add(BUFFER_LEDGERS)
+        .saturating_add(RESERVATION_EXPIRY_GRACE_LEDGERS)
         .max(RESERVATION_TTL_MIN_LEDGERS);
 
     // threshold == ttl_ledgers forces an unconditional bump regardless of the
     // current remaining TTL (which is unknown / network-default at creation).
     env.storage()
-        .temporary()
+        .persistent()
         .extend_ttl(&key, ttl_ledgers, ttl_ledgers);
 }
 
 pub fn get_reservation(env: &Env, id: u64) -> Option<crate::types::Reservation> {
-    env.storage().temporary().get(&DataKey::Reservation(id))
+    env.storage().persistent().get(&DataKey::Reservation(id))
 }
 
 pub fn remove_reservation(env: &Env, id: u64) {
-    env.storage().temporary().remove(&DataKey::Reservation(id));
+    env.storage().persistent().remove(&DataKey::Reservation(id));
 }

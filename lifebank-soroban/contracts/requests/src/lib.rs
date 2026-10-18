@@ -38,6 +38,9 @@ use inventory_client::InventoryContractClient;
 
 const CONTRACT_VERSION: u32 = 1;
 
+/// Inventory's `ContractError::ReservationNotFound` discriminant.
+const INVENTORY_RESERVATION_NOT_FOUND: u32 = 150;
+
 /// Maximum number of entries accepted by `batch_create_requests`.
 /// Mirrors the sibling matching contract's `MAX_BATCH_SIZE` so callers hit a
 /// dedicated error instead of the instruction or storage-write limit.
@@ -100,7 +103,15 @@ impl RequestContract {
             // Use cross-contract authorization: the requests contract itself is
             // the authorized intermediary. The inventory contract verifies that
             // this function is called FROM the requests contract address.
-            inv_client.release_reservation_by_contract(&requests_contract, &res_id);
+            // A reservation that was already expired via `expire_reservation` has
+            // nothing left to release, so `ReservationNotFound` counts as released
+            // and the cancellation/rejection still goes through.
+            let not_found = soroban_sdk::Error::from_contract_error(INVENTORY_RESERVATION_NOT_FOUND);
+            match inv_client.try_release_reservation_by_contract(&requests_contract, &res_id) {
+                Ok(Ok(())) => {}
+                Err(Ok(err)) if err == not_found => {}
+                _ => panic!("inventory reservation release failed"),
+            }
             request.reservation_id = None;
             true
         } else {
