@@ -1,45 +1,23 @@
 #[cfg(test)]
 mod security_tests {
-    use crate::{DisputeReason, Error, PaymentContract, PaymentContractClient, REQ_CONTRACT};
+    use crate::{DisputeReason, Error, PaymentContract, PaymentContractClient, PaymentStatus};
     use request_contract::{
         BloodComponent, BloodType, RequestContract, RequestContractClient, Urgency,
     };
     use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
-    struct Setup<'a> {
-        env: Env,
-        client: PaymentContractClient<'a>,
-        payer: Address,
-        payee: Address,
-        payment_id: u64,
-    }
-
-    /// Registers the payment and request contracts and creates one Pending
+    /// Payment contract wired to a live request contract, with one Pending
     /// payment between a fresh payer and payee.
-    fn setup<'a>() -> Setup<'a> {
+    fn setup_with_payment<'a>() -> (Env, PaymentContractClient<'a>, u64, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
-        let admin = Address::generate(&env);
-        let payer = Address::generate(&env);
-        let payee = Address::generate(&env);
-
-        let payment_contract_id = env.register(PaymentContract, ());
-        let requests_contract_id = env.register(RequestContract, ());
-        let requests_client = RequestContractClient::new(&env, &requests_contract_id);
-        requests_client.initialize(&admin, &Address::generate(&env));
+        let requests_id = env.register(RequestContract, ());
+        let requests = RequestContractClient::new(&env, &requests_id);
+        requests.initialize(&Address::generate(&env), &Address::generate(&env));
         let hospital = Address::generate(&env);
-        requests_client.authorize_hospital(&hospital);
-
-        let client = PaymentContractClient::new(&env, &payment_contract_id);
-        client.initialize(&admin, &None);
-        env.as_contract(&payment_contract_id, || {
-            env.storage()
-                .instance()
-                .set(&REQ_CONTRACT, &requests_contract_id);
-        });
-
-        let request_id = requests_client.create_request(
+        requests.authorize_hospital(&hospital);
+        let request_id = requests.create_request(
             &hospital,
             &BloodType::OPositive,
             &BloodComponent::WholeBlood,
@@ -47,61 +25,67 @@ mod security_tests {
             &Urgency::Routine,
             &(env.ledger().timestamp() + 3_600),
         );
-        let payment_id = client.create_payment(&request_id, &payer, &payee, &100i128);
 
-        Setup {
-            env,
-            client,
-            payer,
-            payee,
-            payment_id,
-        }
+        let cid = env.register(PaymentContract, ());
+        let client = PaymentContractClient::new(&env, &cid);
+        client.initialize(&Address::generate(&env), &Some(requests_id));
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let payment_id = client.create_payment(&request_id, &payer, &payee, &100i128);
+        (env, client, payment_id, payer, payee)
     }
 
     /// #1152: Verify record_dispute requires caller to be payer or payee.
     /// A third party cannot open disputes on payments they're not part of.
     #[test]
     fn test_record_dispute_requires_party_involvement() {
-        let s = setup();
-        let third_party = Address::generate(&s.env);
+        let (env, client, payment_id, _payer, _payee) = setup_with_payment();
+        let third_party = Address::generate(&env);
 
-        let dispute_result = s.client.try_record_dispute(
-            &s.payment_id,
+        let result = client.try_record_dispute(
+            &payment_id,
             &DisputeReason::PaymentContested,
-            &String::from_str(&s.env, "case123"),
+            &String::from_str(&env, "case123"),
             &third_party,
         );
 
-        assert_eq!(dispute_result, Err(Ok(Error::Unauthorized)));
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
     }
 
     /// #1152: Verify record_dispute succeeds when called by payer.
     #[test]
     fn test_record_dispute_by_payer_succeeds() {
-        let s = setup();
+        let (env, client, payment_id, payer, _payee) = setup_with_payment();
 
-        let result = s.client.try_record_dispute(
-            &s.payment_id,
+        client.record_dispute(
+            &payment_id,
             &DisputeReason::PaymentContested,
-            &String::from_str(&s.env, "case123"),
-            &s.payer,
+            &String::from_str(&env, "case123"),
+            &payer,
         );
 
-        assert_eq!(result, Ok(Ok(())));
+        assert_eq!(
+            client.get_payment(&payment_id).status,
+            PaymentStatus::Disputed
+        );
     }
 
     /// #1152: Verify record_dispute succeeds when called by payee.
     #[test]
     fn test_record_dispute_by_payee_succeeds() {
-        let s = setup();
+        let (env, client, payment_id, _payer, payee) = setup_with_payment();
 
-        let result = s.client.try_record_dispute(
-            &s.payment_id,
+        client.record_dispute(
+            &payment_id,
             &DisputeReason::PaymentContested,
-            &String::from_str(&s.env, "case123"),
-            &s.payee,
+            &String::from_str(&env, "case123"),
+            &payee,
         );
 
-        assert_eq!(result, Ok(Ok(())));
+        assert_eq!(
+            client.get_payment(&payment_id).status,
+            PaymentStatus::Disputed
+        );
     }
 }

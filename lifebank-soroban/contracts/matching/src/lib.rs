@@ -296,11 +296,7 @@ impl MatchingContract {
         for i in 0..request_ids.len() {
             let rid = request_ids.get(i).unwrap();
             // Skip requests that don't exist or can't be loaded.
-            let req = match req_client
-                .try_get_request(&rid)
-                .ok()
-                .and_then(|r| r.ok())
-            {
+            let req = match req_client.try_get_request(&rid).ok().and_then(|r| r.ok()) {
                 Some(r) => r,
                 None => continue,
             };

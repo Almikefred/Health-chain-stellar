@@ -11,13 +11,35 @@
 mod security_tests {
     use crate::types::{BloodStatus, BloodUnit, Reservation, Role};
     use crate::{BloodType, ContractError, InventoryContract, InventoryContractClient};
-    use soroban_sdk::{testutils::{Address as _, Ledger as _}, vec, Address, Env, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        vec, Address, Env, String,
+    };
+
+    /// Flatten a generated `try_*` result into the contract's own error type.
+    /// Conversion or host failures are bugs in the test and panic.
+    trait IntoContractResult<T> {
+        fn into_contract(self) -> Result<T, ContractError>;
+    }
+
+    impl<T, C: core::fmt::Debug, I: core::fmt::Debug> IntoContractResult<T>
+        for Result<Result<T, C>, Result<ContractError, I>>
+    {
+        fn into_contract(self) -> Result<T, ContractError> {
+            match self {
+                Ok(Ok(v)) => Ok(v),
+                Err(Ok(e)) => Err(e),
+                Ok(Err(e)) => panic!("conversion error: {:?}", e),
+                Err(Err(e)) => panic!("invoke error: {:?}", e),
+            }
+        }
+    }
 
     struct TestInventoryClient<'a> {
         client: InventoryContractClient<'a>,
     }
 
-    fn create_client<'a>(env: &'a Env) -> TestInventoryClient<'a> {
+    fn create_client(env: &Env) -> TestInventoryClient<'_> {
         let contract_id = env.register(InventoryContract, ());
         TestInventoryClient {
             client: InventoryContractClient::new(env, &contract_id),
@@ -26,10 +48,7 @@ mod security_tests {
 
     impl TestInventoryClient<'_> {
         fn initialize(&self, _env: Env, admin: Address) -> Result<(), ContractError> {
-            self.client
-                .try_initialize(&admin)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+            self.client.try_initialize(&admin).into_contract()
         }
 
         fn authorize_bank(
@@ -41,8 +60,7 @@ mod security_tests {
         ) -> Result<(), ContractError> {
             self.client
                 .try_authorize_bank(&admin, &bank, &authorized)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .into_contract()
         }
 
         fn register_blood(
@@ -55,15 +73,8 @@ mod security_tests {
             donor_id: Option<Address>,
         ) -> Result<u64, ContractError> {
             self.client
-                .try_register_blood(
-                    &bank,
-                    &serial_number,
-                    &blood_type,
-                    &quantity_ml,
-                    &donor_id,
-                )
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .try_register_blood(&bank, &serial_number, &blood_type, &quantity_ml, &donor_id)
+                .into_contract()
         }
 
         fn reserve_blood(
@@ -76,8 +87,7 @@ mod security_tests {
         ) -> Result<u64, ContractError> {
             self.client
                 .try_reserve_blood(&requester, &unit_ids, &request_id, &duration_seconds)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .into_contract()
         }
 
         fn batch_reserve_blood(
@@ -88,8 +98,7 @@ mod security_tests {
         ) -> Result<soroban_sdk::Vec<u64>, ContractError> {
             self.client
                 .try_batch_reserve_blood(&requester, &batch)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .into_contract()
         }
 
         fn get_reservation(
@@ -99,8 +108,7 @@ mod security_tests {
         ) -> Result<Reservation, ContractError> {
             self.client
                 .try_get_reservation(&reservation_id)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .into_contract()
         }
 
         fn release_reservation_by_contract(
@@ -111,8 +119,7 @@ mod security_tests {
         ) -> Result<(), ContractError> {
             self.client
                 .try_release_reservation_by_contract(&authorized_contract, &reservation_id)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .into_contract()
         }
 
         fn grant_role(
@@ -124,8 +131,7 @@ mod security_tests {
         ) -> Result<(), ContractError> {
             self.client
                 .try_grant_role(&admin, &grantee, &role)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .into_contract()
         }
 
         fn update_status(
@@ -138,8 +144,7 @@ mod security_tests {
         ) -> Result<BloodUnit, ContractError> {
             self.client
                 .try_update_status(&unit_id, &new_status, &authorized_by, &reason)
-                .map(|r| r.unwrap())
-                .map_err(|e| e.unwrap())
+                .into_contract()
         }
     }
 
@@ -156,31 +161,28 @@ mod security_tests {
         let client = create_client(&env);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank_a.clone(), true)
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank_a.clone(), true)
             .unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank_b.clone(), true)
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank_b.clone(), true)
             .unwrap();
 
         // Bank A registers a blood unit
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank_a.clone(),
-            String::from_str(&env, "SN001"),
-            BloodType::OPositive,
-            500,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank_a.clone(),
+                String::from_str(&env, "SN001"),
+                BloodType::OPositive,
+                500,
+                None,
+            )
+            .unwrap();
 
         // Bank B attempts to reserve Bank A's blood unit
         let unit_ids = vec![&env, unit_id];
-        let result = client.reserve_blood(
-            env.clone(),
-            bank_b.clone(),
-            unit_ids,
-            1,
-            3600,
-        );
+        let result = client.reserve_blood(env.clone(), bank_b.clone(), unit_ids, 1, 3600);
 
         // Should fail: unit belongs to Bank A, not Bank B
         assert_eq!(result, Err(ContractError::NotUnitOwner));
@@ -197,29 +199,25 @@ mod security_tests {
         let client = create_client(&env);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank_a.clone(), true)
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank_a.clone(), true)
             .unwrap();
 
         // Bank A registers a blood unit
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank_a.clone(),
-            String::from_str(&env, "SN001"),
-            BloodType::OPositive,
-            500,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank_a.clone(),
+                String::from_str(&env, "SN001"),
+                BloodType::OPositive,
+                500,
+                None,
+            )
+            .unwrap();
 
         // Bank A reserves its own blood unit
         let unit_ids = vec![&env, unit_id];
-        let result = client.reserve_blood(
-            env.clone(),
-            bank_a.clone(),
-            unit_ids,
-            1,
-            3600,
-        );
+        let result = client.reserve_blood(env.clone(), bank_a.clone(), unit_ids, 1, 3600);
 
         assert!(result.is_ok());
     }
@@ -236,41 +234,41 @@ mod security_tests {
         let client = create_client(&env);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank_a.clone(), true)
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank_a.clone(), true)
             .unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank_b.clone(), true)
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank_b.clone(), true)
             .unwrap();
 
         // Bank A registers units
-        let unit_1 = client.register_blood(
-            env.clone(),
-            bank_a.clone(),
-            String::from_str(&env, "SN001"),
-            BloodType::OPositive,
-            500,
-            None,
-        )
-        .unwrap();
+        let unit_1 = client
+            .register_blood(
+                env.clone(),
+                bank_a.clone(),
+                String::from_str(&env, "SN001"),
+                BloodType::OPositive,
+                500,
+                None,
+            )
+            .unwrap();
 
-        let unit_2 = client.register_blood(
-            env.clone(),
-            bank_a.clone(),
-            String::from_str(&env, "SN002"),
-            BloodType::OPositive,
-            500,
-            None,
-        )
-        .unwrap();
+        let unit_2 = client
+            .register_blood(
+                env.clone(),
+                bank_a.clone(),
+                String::from_str(&env, "SN002"),
+                BloodType::OPositive,
+                500,
+                None,
+            )
+            .unwrap();
 
         // Bank B attempts batch reserve of Bank A's units
         let unit_ids = vec![&env, unit_1, unit_2];
         let batch = vec![&env, (unit_ids, 1u64, 3600u64)];
 
-        let result = client.batch_reserve_blood(
-            env.clone(),
-            bank_b.clone(),
-            batch,
-        );
+        let result = client.batch_reserve_blood(env.clone(), bank_b.clone(), batch);
 
         // Should fail on first unit ownership check
         assert_eq!(result, Err(ContractError::NotUnitOwner));
@@ -314,13 +312,9 @@ mod security_tests {
         let client = create_client(&env);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(
-            env.clone(),
-            admin.clone(),
-            authorized_bank.clone(),
-            true,
-        )
-        .unwrap();
+        client
+            .authorize_bank(env.clone(), admin.clone(), authorized_bank.clone(), true)
+            .unwrap();
 
         let result = client.register_blood(
             env.clone(),
@@ -346,30 +340,28 @@ mod security_tests {
         let client = create_client(&env);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank.clone(), true).unwrap();
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank.clone(), true)
+            .unwrap();
 
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank.clone(),
-            String::from_str(&env, "SN001"),
-            BloodType::OPositive,
-            500,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank.clone(),
+                String::from_str(&env, "SN001"),
+                BloodType::OPositive,
+                500,
+                None,
+            )
+            .unwrap();
 
         // Attempt to reserve with duration exceeding MAX_RESERVATION_DURATION_SECS (86400 * 7)
         let max_allowed = 86_400u64 * 7;
         let oversized_duration = max_allowed + 1;
 
         let unit_ids = vec![&env, unit_id];
-        let result = client.reserve_blood(
-            env.clone(),
-            bank.clone(),
-            unit_ids,
-            1,
-            oversized_duration,
-        );
+        let result =
+            client.reserve_blood(env.clone(), bank.clone(), unit_ids, 1, oversized_duration);
 
         // Should return InvalidInput error, not panic
         assert_eq!(result, Err(ContractError::InvalidInput));
@@ -386,27 +378,24 @@ mod security_tests {
         let client = create_client(&env);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank.clone(), true).unwrap();
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank.clone(), true)
+            .unwrap();
 
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank.clone(),
-            String::from_str(&env, "SN001"),
-            BloodType::OPositive,
-            500,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank.clone(),
+                String::from_str(&env, "SN001"),
+                BloodType::OPositive,
+                500,
+                None,
+            )
+            .unwrap();
 
         let max_allowed = 86_400u64 * 7;
         let unit_ids = vec![&env, unit_id];
-        let result = client.reserve_blood(
-            env.clone(),
-            bank,
-            unit_ids,
-            1,
-            max_allowed,
-        );
+        let result = client.reserve_blood(env.clone(), bank, unit_ids, 1, max_allowed);
 
         assert!(result.is_ok());
     }
@@ -423,27 +412,34 @@ mod security_tests {
         let client = create_client(&env);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank.clone(), true).unwrap();
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank.clone(), true)
+            .unwrap();
 
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank.clone(),
-            String::from_str(&env, "SN001"),
-            BloodType::OPositive,
-            500,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank.clone(),
+                String::from_str(&env, "SN001"),
+                BloodType::OPositive,
+                500,
+                None,
+            )
+            .unwrap();
 
         let unit_ids = vec![&env, unit_id];
-        let reservation_id =
-            client.reserve_blood(env.clone(), bank.clone(), unit_ids, 1, 3600)
-                .unwrap();
+        let reservation_id = client
+            .reserve_blood(env.clone(), bank.clone(), unit_ids, 1, 3600)
+            .unwrap();
 
         // Verify reservation exists before release
-        let reservation =
-            client.get_reservation(env.clone(), reservation_id).unwrap();
+        let reservation = client.get_reservation(env.clone(), reservation_id).unwrap();
         assert_eq!(reservation.unit_ids.len(), 1);
+
+        // Only the stored requests contract may release through this entry point.
+        client
+            .client
+            .set_requests_contract(&admin, &authorized_contract);
 
         // Call release_reservation_by_contract with the public signature
         let result = client.release_reservation_by_contract(
@@ -478,29 +474,34 @@ mod security_tests {
         env.ledger().set_timestamp(1000u64);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank.clone(), true).unwrap();
-        client.grant_role(env.clone(), admin.clone(), rider.clone(), Role::Rider)
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank.clone(), true)
+            .unwrap();
+        client
+            .grant_role(env.clone(), admin.clone(), rider.clone(), Role::Rider)
             .unwrap();
 
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank.clone(),
-            String::from_str(&env, "SN-RIDER-001"),
-            BloodType::OPositive,
-            450,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank.clone(),
+                String::from_str(&env, "SN-RIDER-001"),
+                BloodType::OPositive,
+                450,
+                None,
+            )
+            .unwrap();
 
         // Move to Reserved (by bank owner) before rider picks up
-        client.update_status(
-            env.clone(),
-            unit_id,
-            BloodStatus::Reserved,
-            bank.clone(),
-            None,
-        )
-        .unwrap();
+        client
+            .update_status(
+                env.clone(),
+                unit_id,
+                BloodStatus::Reserved,
+                bank.clone(),
+                None,
+            )
+            .unwrap();
 
         // Rider marks as InTransit — must succeed (issue #1316 fix)
         let result = client.update_status(
@@ -510,7 +511,10 @@ mod security_tests {
             rider.clone(),
             None,
         );
-        assert!(result.is_ok(), "Rider should be able to mark unit InTransit");
+        assert!(
+            result.is_ok(),
+            "Rider should be able to mark unit InTransit"
+        );
         assert_eq!(result.unwrap().status, BloodStatus::InTransit);
     }
 
@@ -529,42 +533,43 @@ mod security_tests {
         env.ledger().set_timestamp(1000u64);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank.clone(), true).unwrap();
-        client.grant_role(
-            env.clone(),
-            admin.clone(),
-            hospital.clone(),
-            Role::Hospital,
-        )
-        .unwrap();
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank.clone(), true)
+            .unwrap();
+        client
+            .grant_role(env.clone(), admin.clone(), hospital.clone(), Role::Hospital)
+            .unwrap();
 
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank.clone(),
-            String::from_str(&env, "SN-HOSP-001"),
-            BloodType::APositive,
-            450,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank.clone(),
+                String::from_str(&env, "SN-HOSP-001"),
+                BloodType::APositive,
+                450,
+                None,
+            )
+            .unwrap();
 
         // Advance to InTransit (by bank owner)
-        client.update_status(
-            env.clone(),
-            unit_id,
-            BloodStatus::Reserved,
-            bank.clone(),
-            None,
-        )
-        .unwrap();
-        client.update_status(
-            env.clone(),
-            unit_id,
-            BloodStatus::InTransit,
-            bank.clone(),
-            None,
-        )
-        .unwrap();
+        client
+            .update_status(
+                env.clone(),
+                unit_id,
+                BloodStatus::Reserved,
+                bank.clone(),
+                None,
+            )
+            .unwrap();
+        client
+            .update_status(
+                env.clone(),
+                unit_id,
+                BloodStatus::InTransit,
+                bank.clone(),
+                None,
+            )
+            .unwrap();
 
         // Hospital marks as Delivered — must succeed (issue #1316 fix)
         let result = client.update_status(
@@ -596,36 +601,42 @@ mod security_tests {
         env.ledger().set_timestamp(1000u64);
 
         client.initialize(env.clone(), admin.clone()).unwrap();
-        client.authorize_bank(env.clone(), admin.clone(), bank.clone(), true).unwrap();
-        client.grant_role(env.clone(), admin.clone(), rider.clone(), Role::Rider)
+        client
+            .authorize_bank(env.clone(), admin.clone(), bank.clone(), true)
+            .unwrap();
+        client
+            .grant_role(env.clone(), admin.clone(), rider.clone(), Role::Rider)
             .unwrap();
 
-        let unit_id = client.register_blood(
-            env.clone(),
-            bank.clone(),
-            String::from_str(&env, "SN-RIDER-002"),
-            BloodType::BPositive,
-            450,
-            None,
-        )
-        .unwrap();
+        let unit_id = client
+            .register_blood(
+                env.clone(),
+                bank.clone(),
+                String::from_str(&env, "SN-RIDER-002"),
+                BloodType::BPositive,
+                450,
+                None,
+            )
+            .unwrap();
 
-        client.update_status(
-            env.clone(),
-            unit_id,
-            BloodStatus::Reserved,
-            bank.clone(),
-            None,
-        )
-        .unwrap();
-        client.update_status(
-            env.clone(),
-            unit_id,
-            BloodStatus::InTransit,
-            bank.clone(),
-            None,
-        )
-        .unwrap();
+        client
+            .update_status(
+                env.clone(),
+                unit_id,
+                BloodStatus::Reserved,
+                bank.clone(),
+                None,
+            )
+            .unwrap();
+        client
+            .update_status(
+                env.clone(),
+                unit_id,
+                BloodStatus::InTransit,
+                bank.clone(),
+                None,
+            )
+            .unwrap();
 
         // Rider tries to mark Delivered — assert_can_transition should reject this
         let result = client.update_status(

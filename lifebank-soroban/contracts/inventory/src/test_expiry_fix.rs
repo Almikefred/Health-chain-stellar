@@ -212,7 +212,10 @@ mod expiry_tests {
         unit_ids.push_back(unit_id);
 
         let result = client.try_reserve_blood(&bank, &unit_ids, &1u64, &1u64);
-        assert!(result.is_ok(), "Unit must be reservable 1 second before expiry");
+        assert!(
+            result.is_ok(),
+            "Unit must be reservable 1 second before expiry"
+        );
     }
 
     /// Boundary test: unit is expired at exactly expiration_timestamp.
@@ -243,6 +246,9 @@ mod expiry_tests {
         unit_ids.push_back(unit_id);
 
         let result = client.try_reserve_blood(&bank, &unit_ids, &1u64, &1u64);
-        assert!(result.is_err(), "Unit must be rejected at expiration_timestamp");
+        assert!(
+            result.is_err(),
+            "Unit must be rejected at expiration_timestamp"
+        );
     }
 }

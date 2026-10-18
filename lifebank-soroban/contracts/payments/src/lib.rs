@@ -167,6 +167,9 @@ pub enum Error {
     InvalidStatusTransition = 523,
     /// The supplied token address is not on the admin-managed allowlist.
     TokenNotAllowed = 525,
+    /// A Disputed payment can only leave Disputed through resolve_dispute or
+    /// process_expired_disputes, which also settle any escrowed funds.
+    DisputeResolutionRequired = 526,
 }
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -176,10 +179,6 @@ const PAYMENT_COUNTER: soroban_sdk::Symbol = symbol_short!("PAY_CTR");
 const PLEDGE_COUNTER: soroban_sdk::Symbol = symbol_short!("PLG_CTR");
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
-const REWARD_TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("RWD_TOK");
-const TOTAL_OUTSTANDING_VESTING: soroban_sdk::Symbol = symbol_short!("OUT_VEST");
-/// Instance-level map: request_id (u64) → payment_id (u64).
-const REQ_IDX: soroban_sdk::Symbol = symbol_short!("REQ_IDX");
 /// Instance-level aggregate stats.
 const STATS_KEY: soroban_sdk::Symbol = symbol_short!("STATS");
 /// Instance storage key for the requests contract address (optional).
@@ -193,6 +192,12 @@ const MAX_DISPUTE_TIMEOUT_SECS: u64 = 365 * 24 * 3600;
 const DISPUTE_TIMEOUT: soroban_sdk::Symbol = symbol_short!("DISP_TO");
 /// Instance storage key for the admin-managed set of allowed token addresses.
 const ALLOWED_TOKENS: soroban_sdk::Symbol = symbol_short!("ALWD_TOK");
+/// Upper bound for a vesting schedule's cliff and duration (10 years). Keeps
+/// `now + duration` far from u64::MAX and rejects schedules that would lock
+/// reward tokens effectively forever.
+const MAX_VESTING_DURATION_SECS: u64 = 10 * 365 * 24 * 3600;
+/// Maximum number of items a single paginated query may return.
+const MAX_PAGE_SIZE: u32 = 100;
 
 /// Persistent storage TTL constants (in ledgers; one ledger ≈ 5 s).
 /// Entries are bumped to PERSISTENT_BUMP_TO whenever their remaining TTL
@@ -217,24 +222,35 @@ fn pledge_key(id: u64) -> (u64, &'static str) {
     (id, "plg")
 }
 
-fn payer_index_key(payer: &Address) -> (Address, &'static str) {
-    (payer.clone(), "pi")
+/// Secondary-index storage keys.
+///
+/// Each index is stored as a length entry plus one persistent entry per
+/// position, rather than as a single `Vec<u64>`. A single Vec grows without
+/// bound (every payment a busy hospital ever made, every payment ever
+/// Released) until reading or rewriting it exceeds the ledger entry size or
+/// the transaction budget, at which point creating or settling payments fails.
+#[contracttype]
+#[derive(Clone)]
+enum IndexKey {
+    PayerLen(Address),
+    PayerAt(Address, u32),
+    PayeeLen(Address),
+    PayeeAt(Address, u32),
+    StatusLen(u32),
+    StatusAt(u32, u32),
+    /// Position of a payment id inside its status index, for O(1) removal.
+    StatusPos(u32, u64),
 }
 
-fn payee_index_key(payee: &Address) -> (Address, &'static str) {
-    (payee.clone(), "pyi")
-}
-
-fn status_index_key(status: PaymentStatus) -> (u32, &'static str) {
-    let code = match status {
+fn status_code(status: PaymentStatus) -> u32 {
+    match status {
         PaymentStatus::Pending => 0u32,
         PaymentStatus::Locked => 1,
         PaymentStatus::Released => 2,
         PaymentStatus::Refunded => 3,
         PaymentStatus::Disputed => 4,
         PaymentStatus::Cancelled => 5,
-    };
-    (code, "si")
+    }
 }
 
 fn get_counter(env: &Env) -> u64 {
@@ -307,48 +323,117 @@ fn remove_vesting(env: &Env, donor: &Address) {
     env.storage().persistent().remove(&vesting_key(donor));
 }
 
-// ── Index helpers ──────────────────────────────────────────────────────────────
+// ── Per-token reserves ─────────────────────────────────────────────────────────
+//
+// Vesting rewards and escrowed payments sit in the same contract balance when
+// they use the same token. Each side's outstanding liability is tracked per
+// token, and every outgoing transfer is followed by a check that the balance
+// still covers both. One side can therefore never be paid out of funds owed
+// to the other.
 
-fn index_by_payer(env: &Env, payer: &Address, id: u64) {
-    let key = payer_index_key(payer);
-    let mut ids: Vec<u64> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(Vec::new(env));
-    ids.push_back(id);
-    env.storage().persistent().set(&key, &ids);
+fn vesting_reserve_key(token: &Address) -> (Address, &'static str) {
+    (token.clone(), "vres")
+}
+
+fn escrow_reserve_key(token: &Address) -> (Address, &'static str) {
+    (token.clone(), "eres")
+}
+
+fn load_reserve(env: &Env, key: &(Address, &'static str)) -> i128 {
+    env.storage().persistent().get(key).unwrap_or(0i128)
+}
+
+fn add_reserve(env: &Env, key: &(Address, &'static str), amount: i128) -> Result<(), Error> {
+    let next = load_reserve(env, key)
+        .checked_add(amount)
+        .ok_or(Error::Overflow)?;
+    env.storage().persistent().set(key, &next);
     env.storage()
         .persistent()
-        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+        .extend_ttl(key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+    Ok(())
+}
+
+/// Floors at zero so liabilities created before reserves were tracked can
+/// still be settled.
+fn release_reserve(env: &Env, key: &(Address, &'static str), amount: i128) {
+    let next = load_reserve(env, key).saturating_sub(amount).max(0);
+    env.storage().persistent().set(key, &next);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+}
+
+/// After an outgoing transfer of `token`, the contract must still hold enough
+/// to cover every outstanding vesting schedule and every unsettled escrow in
+/// that token. Returning Err reverts the transfer.
+fn ensure_reserves_covered(env: &Env, token: &Address) -> Result<(), Error> {
+    let required = load_reserve(env, &vesting_reserve_key(token))
+        .checked_add(load_reserve(env, &escrow_reserve_key(token)))
+        .ok_or(Error::Overflow)?;
+    let balance = token::Client::new(env, token).balance(&env.current_contract_address());
+    if balance < required {
+        return Err(Error::InsufficientEscrowFunds);
+    }
+    Ok(())
+}
+
+/// Pay an escrowed amount out to `to`, releasing it from the escrow reserve.
+fn pay_out_escrow(env: &Env, token: &Address, to: &Address, amount: i128) -> Result<(), Error> {
+    release_reserve(env, &escrow_reserve_key(token), amount);
+    token::Client::new(env, token).transfer(&env.current_contract_address(), to, &amount);
+    ensure_reserves_covered(env, token)
+}
+
+// ── Index helpers ──────────────────────────────────────────────────────────────
+
+fn set_index_entry<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &IndexKey,
+    val: &V,
+) {
+    env.storage().persistent().set(key, val);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+}
+
+fn index_len(env: &Env, len_key: &IndexKey) -> u32 {
+    env.storage().persistent().get(len_key).unwrap_or(0u32)
+}
+
+/// Append `id` at the end of an index and return the position it was stored at.
+fn index_push(
+    env: &Env,
+    len_key: &IndexKey,
+    entry_key: impl FnOnce(u32) -> IndexKey,
+    id: u64,
+) -> u32 {
+    let pos = index_len(env, len_key);
+    set_index_entry(env, &entry_key(pos), &id);
+    set_index_entry(env, len_key, &(pos + 1));
+    pos
+}
+
+fn index_by_payer(env: &Env, payer: &Address, id: u64) {
+    let len_key = IndexKey::PayerLen(payer.clone());
+    index_push(env, &len_key, |i| IndexKey::PayerAt(payer.clone(), i), id);
 }
 
 fn index_by_payee(env: &Env, payee: &Address, id: u64) {
-    let key = payee_index_key(payee);
-    let mut ids: Vec<u64> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(Vec::new(env));
-    ids.push_back(id);
-    env.storage().persistent().set(&key, &ids);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+    let len_key = IndexKey::PayeeLen(payee.clone());
+    index_push(env, &len_key, |i| IndexKey::PayeeAt(payee.clone(), i), id);
 }
 
 fn index_by_status(env: &Env, status: PaymentStatus, id: u64) {
-    let key = status_index_key(status);
-    let mut ids: Vec<u64> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(Vec::new(env));
-    ids.push_back(id);
-    env.storage().persistent().set(&key, &ids);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+    let code = status_code(status);
+    let pos = index_push(
+        env,
+        &IndexKey::StatusLen(code),
+        |i| IndexKey::StatusAt(code, i),
+        id,
+    );
+    set_index_entry(env, &IndexKey::StatusPos(code, id), &pos);
 }
 
 fn req_idx_key(request_id: u64) -> (u64, &'static str) {
@@ -358,9 +443,14 @@ fn req_idx_key(request_id: u64) -> (u64, &'static str) {
 /// Store a single request_id → payment_id mapping in persistent storage.
 /// Each entry is independent, preventing unbounded instance-storage growth.
 fn index_by_request(env: &Env, request_id: u64, payment_id: u64) {
+    let key = req_idx_key(request_id);
+    env.storage().persistent().set(&key, &payment_id);
+    // Without a bump this entry archives on the default TTL while the payment
+    // is still live; the DuplicatePayment guard then stops seeing it and a
+    // second payment for the same request is accepted.
     env.storage()
         .persistent()
-        .set(&req_idx_key(request_id), &payment_id);
+        .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
 /// Remove the request index entry once the payment reaches a terminal state
@@ -401,22 +491,31 @@ fn timeline_append(env: &Env, request_id: u64, payment_id: u64) {
         .extend_ttl(&key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
 }
 
-/// Remove `id` from the persistent Vec stored under the given status index key.
+/// Remove `id` from the status index in O(1) by moving the last entry into
+/// its slot. Order within a status index is therefore not insertion order.
 fn remove_from_status_index(env: &Env, status: PaymentStatus, id: u64) {
-    let key = status_index_key(status);
-    let ids: Vec<u64> = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(Vec::new(env));
-    let mut new_ids: Vec<u64> = Vec::new(env);
-    for i in 0..ids.len() {
-        let existing = ids.get(i).unwrap();
-        if existing != id {
-            new_ids.push_back(existing);
-        }
+    let code = status_code(status);
+    let pos_key = IndexKey::StatusPos(code, id);
+    let pos: u32 = match env.storage().persistent().get(&pos_key) {
+        Some(p) => p,
+        None => return,
+    };
+    let len_key = IndexKey::StatusLen(code);
+    let last = index_len(env, &len_key).saturating_sub(1);
+    if pos != last {
+        let moved: u64 = env
+            .storage()
+            .persistent()
+            .get(&IndexKey::StatusAt(code, last))
+            .unwrap();
+        set_index_entry(env, &IndexKey::StatusAt(code, pos), &moved);
+        set_index_entry(env, &IndexKey::StatusPos(code, moved), &pos);
     }
-    env.storage().persistent().set(&key, &new_ids);
+    env.storage()
+        .persistent()
+        .remove(&IndexKey::StatusAt(code, last));
+    env.storage().persistent().remove(&pos_key);
+    set_index_entry(env, &len_key, &last);
 }
 
 // ── Stats helpers ──────────────────────────────────────────────────────────────
@@ -937,11 +1036,12 @@ impl PaymentContract {
         index_by_request(&env, request_id, id);
         timeline_append(&env, request_id, id);
         update_stats_on_transition(&env, amount, PaymentStatus::Pending, PaymentStatus::Locked)?;
+        add_reserve(&env, &escrow_reserve_key(&token), amount)?;
 
         // External call last — any failure here will revert the entire transaction,
         // including the state writes above, so no inconsistency can persist.
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&hospital, &env.current_contract_address(), &amount);
+        token_client.transfer(&hospital, env.current_contract_address(), &amount);
 
         PaymentEscrowed { payment_id: id }.publish(&env);
 
@@ -970,9 +1070,11 @@ impl PaymentContract {
         // Mark coordinator confirmation
         let coord_key = (payment_id, "coord_ok");
         env.storage().persistent().set(&coord_key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&coord_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &coord_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_TO,
+        );
 
         // Check if hospital has also confirmed
         let hosp_key = (payment_id, "hosp_ok");
@@ -986,12 +1088,7 @@ impl PaymentContract {
 
         // Both parties confirmed - release payment
         let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
-        let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &payment.payee,
-            &payment.amount,
-        );
+        pay_out_escrow(&env, &token_addr, &payment.payee, payment.amount)?;
 
         let old_status = payment.status;
         payment.status = PaymentStatus::Released;
@@ -1035,9 +1132,11 @@ impl PaymentContract {
         // Mark hospital confirmation
         let hosp_key = (payment_id, "hosp_ok");
         env.storage().persistent().set(&hosp_key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&hosp_key, PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_TO);
+        env.storage().persistent().extend_ttl(
+            &hosp_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_TO,
+        );
 
         // Check if coordinator has also confirmed
         let coord_key = (payment_id, "coord_ok");
@@ -1052,12 +1151,7 @@ impl PaymentContract {
 
         // Both parties confirmed - release payment
         let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
-        let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &payment.payee,
-            &payment.amount,
-        );
+        pay_out_escrow(&env, &token_addr, &payment.payee, payment.amount)?;
 
         let old_status = payment.status;
         payment.status = PaymentStatus::Released;
@@ -1097,12 +1191,7 @@ impl PaymentContract {
         }
 
         let token_addr = payment.token.clone().ok_or(Error::NotEscrowPayment)?;
-        let token_client = token::Client::new(&env, &token_addr);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &payment.payer,
-            &payment.amount,
-        );
+        pay_out_escrow(&env, &token_addr, &payment.payer, payment.amount)?;
 
         let old_status = payment.status;
         payment.status = PaymentStatus::Refunded;
@@ -1137,13 +1226,24 @@ impl PaymentContract {
         // Security fix: prevent escrow bypass via update_status
         // Released/Refunded require actual token transfer, which must go through
         // release_escrow/refund_escrow. update_status cannot move funds.
-        if matches!(status, PaymentStatus::Released | PaymentStatus::Refunded) {
-            if payment.token.is_some() {
-                return Err(Error::EscrowSettlementRequired);
-            }
+        // Cancelled is included: cancelling an escrow here would strand the
+        // locked tokens in the contract with no path back to either party.
+        if matches!(
+            status,
+            PaymentStatus::Released | PaymentStatus::Refunded | PaymentStatus::Cancelled
+        ) && payment.token.is_some()
+        {
+            return Err(Error::EscrowSettlementRequired);
         }
 
         let old_status = payment.status;
+
+        // A dispute is closed only by resolve_dispute / process_expired_disputes.
+        // Letting update_status move it on would skip the resolution record
+        // (dispute_resolved) and, for escrows, the settlement transfer.
+        if old_status == PaymentStatus::Disputed && status != PaymentStatus::Disputed {
+            return Err(Error::DisputeResolutionRequired);
+        }
 
         // Security fix: a terminal payment (Released/Refunded/Cancelled) must
         // never move back to a non-terminal status. remove_from_request_index
@@ -1243,23 +1343,11 @@ impl PaymentContract {
 
         // ── Escrow: execute the token transfer ────────────────────────────
         if let Some(ref token_addr) = payment.token {
-            let token_client = token::Client::new(&env, token_addr);
-            match resolution {
-                DisputeResolution::ReleaseToPayee => {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &payment.payee,
-                        &payment.amount,
-                    );
-                }
-                DisputeResolution::RefundToPayer => {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &payment.payer,
-                        &payment.amount,
-                    );
-                }
-            }
+            let to = match resolution {
+                DisputeResolution::ReleaseToPayee => &payment.payee,
+                DisputeResolution::RefundToPayer => &payment.payer,
+            };
+            pay_out_escrow(&env, token_addr, to, payment.amount)?;
         }
 
         // ── Update payment state ──────────────────────────────────────────
@@ -1325,13 +1413,14 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
-        let ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&payer_index_key(&payer))
-            .unwrap_or(Vec::new(&env));
-        Self::load_page(&env, ids, page, page_size)
+        let total = index_len(&env, &IndexKey::PayerLen(payer.clone()));
+        Self::load_page(
+            &env,
+            total,
+            |i| IndexKey::PayerAt(payer.clone(), i),
+            page,
+            page_size,
+        )
     }
 
     pub fn get_payments_by_payee(
@@ -1340,13 +1429,14 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
-        let ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&payee_index_key(&payee))
-            .unwrap_or(Vec::new(&env));
-        Self::load_page(&env, ids, page, page_size)
+        let total = index_len(&env, &IndexKey::PayeeLen(payee.clone()));
+        Self::load_page(
+            &env,
+            total,
+            |i| IndexKey::PayeeAt(payee.clone(), i),
+            page,
+            page_size,
+        )
     }
 
     pub fn get_payments_by_status(
@@ -1355,13 +1445,15 @@ impl PaymentContract {
         page: u32,
         page_size: u32,
     ) -> PaymentPage {
-        let page_size = if page_size == 0 { 20 } else { page_size };
-        let ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&status_index_key(status))
-            .unwrap_or(Vec::new(&env));
-        Self::load_page(&env, ids, page, page_size)
+        let code = status_code(status);
+        let total = index_len(&env, &IndexKey::StatusLen(code));
+        Self::load_page(
+            &env,
+            total,
+            |i| IndexKey::StatusAt(code, i),
+            page,
+            page_size,
+        )
     }
 
     pub fn get_payment_statistics(env: Env) -> PaymentStats {
@@ -1387,7 +1479,8 @@ impl PaymentContract {
             .unwrap_or(Vec::new(&env));
         let total = ids.len();
         let start = offset;
-        let end = (start + limit).min(total);
+        // saturating: offset near u32::MAX must not overflow and panic.
+        let end = start.saturating_add(limit).min(total);
         let mut items: Vec<Payment> = Vec::new(&env);
         if start < total {
             for i in start..end {
@@ -1499,6 +1592,9 @@ impl PaymentContract {
         if duration_secs <= cliff_secs {
             return Err(Error::InvalidVestingSchedule);
         }
+        if duration_secs > MAX_VESTING_DURATION_SECS {
+            return Err(Error::InvalidVestingSchedule);
+        }
 
         // Reject if donor already has an active (uncompleted) vesting schedule.
         // Overwriting it would silently destroy unclaimed rewards.
@@ -1512,21 +1608,15 @@ impl PaymentContract {
             return Err(Error::ActiveVestingExists);
         }
 
-        let token_client = token::Client::new(&env, &reward_token);
-        token_client.transfer(&admin, &env.current_contract_address(), &total_amount);
-
-        let current_outstanding: i128 = env
-            .storage()
-            .instance()
-            .get(&TOTAL_OUTSTANDING_VESTING)
-            .unwrap_or(0i128);
-        env.storage()
-            .instance()
-            .set(&TOTAL_OUTSTANDING_VESTING, &current_outstanding.checked_add(total_amount).unwrap_or(current_outstanding));
-
+        // Overflow is an error: clamping to `now` would make the whole amount
+        // claimable immediately.
         let now = env.ledger().timestamp();
-        let cliff_timestamp = now.checked_add(cliff_secs).unwrap_or(now);
-        let vest_end_timestamp = now.checked_add(duration_secs).unwrap_or(now);
+        let cliff_timestamp = now.checked_add(cliff_secs).ok_or(Error::Overflow)?;
+        let vest_end_timestamp = now.checked_add(duration_secs).ok_or(Error::Overflow)?;
+
+        add_reserve(&env, &vesting_reserve_key(&reward_token), total_amount)?;
+        let token_client = token::Client::new(&env, &reward_token);
+        token_client.transfer(&admin, env.current_contract_address(), &total_amount);
 
         let schedule = VestingSchedule {
             donor: donor.clone(),
@@ -1567,11 +1657,17 @@ impl PaymentContract {
         let vested = if now >= schedule.vest_end_timestamp {
             schedule.total_amount
         } else {
-            let elapsed = now.checked_sub(schedule.cliff_timestamp).unwrap_or(0);
-            let duration = schedule.vest_end_timestamp.checked_sub(schedule.cliff_timestamp).unwrap_or(1);
-            (schedule.total_amount.checked_mul(elapsed as i128).unwrap_or(0))
-                .checked_div(duration as i128)
-                .unwrap_or(0)
+            let elapsed = now.saturating_sub(schedule.cliff_timestamp);
+            let duration = schedule
+                .vest_end_timestamp
+                .checked_sub(schedule.cliff_timestamp)
+                .unwrap_or(1);
+            (schedule
+                .total_amount
+                .checked_mul(elapsed as i128)
+                .unwrap_or(0))
+            .checked_div(duration as i128)
+            .unwrap_or(0)
         };
 
         let claimable = vested.checked_sub(schedule.claimed).unwrap_or(0);
@@ -1579,30 +1675,30 @@ impl PaymentContract {
             return Err(Error::NothingToClaim);
         }
 
-        let new_claimed = schedule.claimed.checked_add(claimable).unwrap_or(schedule.claimed);
+        let new_claimed = schedule
+            .claimed
+            .checked_add(claimable)
+            .unwrap_or(schedule.claimed);
         if new_claimed > schedule.total_amount {
             return Err(Error::NothingToClaim);
         }
 
-        let current_outstanding: i128 = env
-            .storage()
-            .instance()
-            .get(&TOTAL_OUTSTANDING_VESTING)
-            .unwrap_or(0i128);
-        env.storage()
-            .instance()
-            .set(&TOTAL_OUTSTANDING_VESTING, &current_outstanding.checked_sub(claimable).unwrap_or(0i128));
-
         schedule.claimed = new_claimed;
-        
+
         if schedule.claimed == schedule.total_amount {
             remove_vesting(&env, &donor);
         } else {
             store_vesting(&env, &schedule);
         }
 
+        release_reserve(
+            &env,
+            &vesting_reserve_key(&schedule.reward_token),
+            claimable,
+        );
         let token_client = token::Client::new(&env, &schedule.reward_token);
         token_client.transfer(&env.current_contract_address(), &donor, &claimable);
+        ensure_reserves_covered(&env, &schedule.reward_token)?;
 
         VestingClaimed {
             donor,
@@ -1616,6 +1712,16 @@ impl PaymentContract {
 
     pub fn get_vesting(env: Env, donor: Address) -> Result<VestingSchedule, Error> {
         load_vesting(&env, &donor).ok_or(Error::VestingNotFound)
+    }
+
+    /// Total unclaimed vesting rewards denominated in `token`.
+    pub fn get_vesting_reserve(env: Env, token: Address) -> i128 {
+        load_reserve(&env, &vesting_reserve_key(&token))
+    }
+
+    /// Total unsettled (Locked or Disputed) escrow denominated in `token`.
+    pub fn get_escrow_reserve(env: Env, token: Address) -> i128 {
+        load_reserve(&env, &escrow_reserve_key(&token))
     }
 
     // ── Dispute timeout (#595) ─────────────────────────────────────────────────
@@ -1741,12 +1847,8 @@ impl PaymentContract {
                 continue;
             }
 
-            let token_client = token::Client::new(&env, payment.token.as_ref().unwrap());
-            token_client.transfer(
-                &env.current_contract_address(),
-                &payment.payer,
-                &payment.amount,
-            );
+            let token_addr = payment.token.clone().unwrap();
+            pay_out_escrow(&env, &token_addr, &payment.payer, payment.amount)?;
 
             let old_status = payment.status;
             payment.status = PaymentStatus::Refunded;
@@ -1782,16 +1884,28 @@ impl PaymentContract {
 
     // ── Internal helpers ───────────────────────────────────────────────────────
 
-    fn load_page(env: &Env, ids: Vec<u64>, page: u32, page_size: u32) -> PaymentPage {
-        let total = ids.len() as u64;
+    /// Load one page of an index. `page_size` 0 means the default of 20 and
+    /// is capped at MAX_PAGE_SIZE so a single call cannot read an entire index.
+    fn load_page(
+        env: &Env,
+        total: u32,
+        entry_key: impl Fn(u32) -> IndexKey,
+        page: u32,
+        page_size: u32,
+    ) -> PaymentPage {
+        let page_size = if page_size == 0 {
+            20
+        } else {
+            page_size.min(MAX_PAGE_SIZE)
+        };
         let start = (page as u64) * (page_size as u64);
         let mut items: Vec<Payment> = Vec::new(env);
 
-        if start < total {
-            let end = (start + page_size as u64).min(total);
+        if start < total as u64 {
+            let end = (start + page_size as u64).min(total as u64);
             for i in start..end {
-                let id = ids.get(i as u32).unwrap();
-                if let Some(p) = load_payment(env, id) {
+                let id: Option<u64> = env.storage().persistent().get(&entry_key(i as u32));
+                if let Some(p) = id.and_then(|id| load_payment(env, id)) {
                     items.push_back(p);
                 }
             }
@@ -1799,7 +1913,7 @@ impl PaymentContract {
 
         PaymentPage {
             items,
-            total,
+            total: total as u64,
             page,
             page_size,
         }
@@ -1834,5 +1948,5 @@ impl PaymentContract {
 }
 
 mod test;
-mod test_two_party_confirmation;
 mod test_security_fixes;
+mod test_two_party_confirmation;

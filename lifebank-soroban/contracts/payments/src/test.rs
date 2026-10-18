@@ -1,11 +1,13 @@
 #![cfg(test)]
+extern crate std;
 
 use super::*;
 use request_contract::{
     BloodComponent, BloodType, RequestContract, RequestContractClient, Urgency,
 };
 use soroban_sdk::{
-    testutils::storage::Instance as _, testutils::Address as _, testutils::Ledger as _, Address, Env,
+    testutils::storage::Instance as _, testutils::Address as _, testutils::Ledger as _, Address,
+    Env,
 };
 
 fn setup<'a>() -> (Env, Address, RequestContractClient<'a>, Address) {
@@ -616,8 +618,18 @@ fn test_update_status_changes_payment_status() {
     let client = PaymentContractClient::new(&env, &cid);
     let admin = Address::generate(&env);
     client.initialize(&admin, &None);
-    
-    let (id, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 500);
+
+    let payer = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let request_id = requests_client.create_request(
+        &hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &250u32,
+        &Urgency::Routine,
+        &(env.ledger().timestamp() + 3_600),
+    );
+    let id = client.create_payment(&request_id, &payer, &payee, &500i128);
 
     // Admin can change status
     client.update_status(&id, &PaymentStatus::Locked, &admin);
@@ -805,7 +817,14 @@ fn test_vesting_pre_cliff_claim_fails() {
     // cliff = now + 1000s, duration = 2000s
     env.ledger().with_mut(|l| l.timestamp = 5000);
     let token_id = deploy_token_with_balance(&env, &admin, &admin, 1_000_000);
-    client.create_vesting(&admin, &donor, &token_id, &1_000_000i128, &1000u64, &2000u64);
+    client.create_vesting(
+        &admin,
+        &donor,
+        &token_id,
+        &1_000_000i128,
+        &1000u64,
+        &2000u64,
+    );
 
     // Try to claim at t=5500 (before cliff at t=6000)
     env.ledger().with_mut(|l| l.timestamp = 5500);
@@ -895,7 +914,8 @@ fn test_vesting_only_admin_can_create() {
     let donor = Address::generate(&env);
     env.ledger().with_mut(|l| l.timestamp = 1_000);
     let token_id = deploy_token_with_balance(&env, &admin, &admin, 1_000);
-    let result = client.try_create_vesting(&attacker, &donor, &token_id, &1_000i128, &100u64, &500u64);
+    let result =
+        client.try_create_vesting(&attacker, &donor, &token_id, &1_000i128, &100u64, &500u64);
     assert!(result.is_err(), "Non-admin must not create vesting");
 }
 
@@ -1306,16 +1326,23 @@ fn test_create_escrow_rejects_negative_amount() {
 /// Security fix for issue #1120: prevents admin from bypassing escrow settlement.
 #[test]
 fn test_update_status_blocks_escrow_bypass() {
-    let (env, cid, admin) = setup_with_admin();
+    let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
 
-    let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
     client.add_allowed_token(&admin, &token_id);
 
     // Create escrow payment (Locked status with token set)
-    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+    let request_id = requests_client.create_request(
+        &hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &250u32,
+        &Urgency::Routine,
+        &(env.ledger().timestamp() + 3_600),
+    );
+    let pid = client.create_escrow(&request_id, &hospital, &payee, &1_000i128, &token_id);
 
     // Try to bypass escrow via update_status → Released (should fail)
     let result = client.try_update_status(&pid, &PaymentStatus::Released, &admin);
@@ -1335,7 +1362,11 @@ fn test_update_status_blocks_escrow_bypass() {
 
     // Verify payment is still Locked
     let p = client.get_payment(&pid);
-    assert_eq!(p.status, PaymentStatus::Locked, "Payment should remain Locked");
+    assert_eq!(
+        p.status,
+        PaymentStatus::Locked,
+        "Payment should remain Locked"
+    );
 
     // Verify tokens still in contract (not moved)
     let token_client = soroban_sdk::token::Client::new(&env, &token_id);
@@ -1349,19 +1380,30 @@ fn test_update_status_blocks_escrow_bypass() {
 /// update_status allows non-terminal transitions on escrow payments (e.g., Locked → Disputed).
 #[test]
 fn test_update_status_allows_non_terminal_transitions() {
-    let (env, cid, admin) = setup_with_admin();
+    let (env, cid, requests_client, hospital) = setup();
     let client = PaymentContractClient::new(&env, &cid);
 
-    let hospital = Address::generate(&env);
     let payee = Address::generate(&env);
     let token_id = deploy_token_with_balance(&env, &admin, &hospital, 5_000);
     client.add_allowed_token(&admin, &token_id);
 
-    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+    let request_id = requests_client.create_request(
+        &hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &250u32,
+        &Urgency::Routine,
+        &(env.ledger().timestamp() + 3_600),
+    );
+    let pid = client.create_escrow(&request_id, &hospital, &payee, &1_000i128, &token_id);
 
     // Locked → Disputed should be allowed (no token transfer needed)
     let result = client.try_update_status(&pid, &PaymentStatus::Disputed, &admin);
-    assert_eq!(result, Ok(Ok(())), "update_status should allow Locked → Disputed");
+    assert_eq!(
+        result,
+        Ok(Ok(())),
+        "update_status should allow Locked → Disputed"
+    );
 
     let p = client.get_payment(&pid);
     assert_eq!(p.status, PaymentStatus::Disputed);
@@ -1375,12 +1417,26 @@ fn test_update_status_allows_terminal_on_non_escrow() {
     let admin = Address::generate(&env);
     client.initialize(&admin, &None);
 
+    let payee = Address::generate(&env);
+    let request_id = requests_client.create_request(
+        &hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &250u32,
+        &Urgency::Routine,
+        &(env.ledger().timestamp() + 3_600),
+    );
+
     // Create non-escrow payment (token = None)
-    let (pid, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 500);
+    let pid = client.create_payment(&request_id, &hospital, &payee, &500i128);
 
     // Pending → Released should work (no escrow, no token to transfer)
     let result = client.try_update_status(&pid, &PaymentStatus::Released, &admin);
-    assert_eq!(result, Ok(Ok(())), "update_status should allow Released on non-escrow");
+    assert_eq!(
+        result,
+        Ok(Ok(())),
+        "update_status should allow Released on non-escrow"
+    );
 
     let p = client.get_payment(&pid);
     assert_eq!(p.status, PaymentStatus::Released);
@@ -1418,4 +1474,229 @@ fn test_instance_ttl_rebumped_on_subsequent_invocation() {
     );
 }
 
+// ── #1606 regressions ─────────────────────────────────────────────────────────
 
+fn new_request(env: &Env, requests_client: &RequestContractClient<'_>, hospital: &Address) -> u64 {
+    requests_client.create_request(
+        hospital,
+        &BloodType::OPositive,
+        &BloodComponent::WholeBlood,
+        &250u32,
+        &Urgency::Routine,
+        &(env.ledger().timestamp() + 3_600),
+    )
+}
+
+/// #1452: the mirrored BloodRequest must decode the request contract's real
+/// struct, which carries `fulfilled_by`.
+#[test]
+fn test_request_mirror_decodes_live_request() {
+    let (env, _cid, requests_client, hospital) = setup();
+    let request_id = new_request(&env, &requests_client, &hospital);
+
+    let mirror = request_client::RequestContractClient::new(&env, &requests_client.address);
+    let req = mirror.get_request(&request_id);
+    assert_eq!(req.id, request_id);
+    assert_eq!(req.fulfilled_by, None);
+}
+
+/// #1454: the request → payment index is bumped like every other entry.
+#[test]
+fn test_request_index_ttl_extended() {
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let (_, request_id, _, _) = make_payment(&env, &client, &requests_client, &hospital, 100);
+
+    let ttl = env.as_contract(&cid, || {
+        env.storage().persistent().get_ttl(&req_idx_key(request_id))
+    });
+    assert!(ttl >= PERSISTENT_BUMP_TO, "request index TTL was {}", ttl);
+}
+
+/// #1455: update_status cannot move a payment out of Disputed.
+#[test]
+fn test_update_status_cannot_exit_disputed() {
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None);
+    let (id, _, payer, _) = make_payment(&env, &client, &requests_client, &hospital, 100);
+    client.record_dispute(
+        &id,
+        &DisputeReason::Other,
+        &soroban_sdk::String::from_str(&env, "case"),
+        &payer,
+    );
+
+    for status in [
+        PaymentStatus::Pending,
+        PaymentStatus::Locked,
+        PaymentStatus::Released,
+        PaymentStatus::Refunded,
+        PaymentStatus::Cancelled,
+    ] {
+        let result = client.try_update_status(&id, &status, &admin);
+        assert_eq!(result, Err(Ok(Error::DisputeResolutionRequired)));
+    }
+    let p = client.get_payment(&id);
+    assert_eq!(p.status, PaymentStatus::Disputed);
+    assert!(!p.dispute_resolved);
+
+    // The dispute path still works.
+    client.resolve_dispute(&id, &DisputeResolution::RefundToPayer, &admin);
+    assert_eq!(client.get_payment(&id).status, PaymentStatus::Refunded);
+}
+
+/// Cancelling an escrow through update_status would strand the locked tokens.
+#[test]
+fn test_update_status_cannot_cancel_escrow() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+    client.add_allowed_token(&admin, &token_id);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+
+    let result = client.try_update_status(&pid, &PaymentStatus::Cancelled, &admin);
+    assert_eq!(result, Err(Ok(Error::EscrowSettlementRequired)));
+    assert_eq!(client.get_payment(&pid).status, PaymentStatus::Locked);
+}
+
+/// #1456: a huge offset must not overflow `offset + limit`.
+#[test]
+fn test_timeline_offset_near_u32_max_does_not_overflow() {
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let (_, request_id, _, _) = make_payment(&env, &client, &requests_client, &hospital, 100);
+
+    let items = client.get_payment_timeline(&request_id, &u32::MAX, &100u32);
+    assert_eq!(items.len(), 0);
+}
+
+/// #1458: indexes are per-position entries; removing from the status index
+/// keeps every other entry reachable.
+#[test]
+fn test_status_index_removal_keeps_remaining_entries() {
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &None);
+    let (id1, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 100);
+    let (id2, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 100);
+    let (id3, _, _, _) = make_payment(&env, &client, &requests_client, &hospital, 100);
+
+    client.update_status(&id1, &PaymentStatus::Locked, &admin);
+
+    let pending = client.get_payments_by_status(&PaymentStatus::Pending, &0u32, &20u32);
+    assert_eq!(pending.total, 2);
+    let ids: std::vec::Vec<u64> = pending.items.iter().map(|p| p.id).collect();
+    assert!(ids.contains(&id2) && ids.contains(&id3));
+
+    let locked = client.get_payments_by_status(&PaymentStatus::Locked, &0u32, &20u32);
+    assert_eq!(locked.total, 1);
+    assert_eq!(locked.items.get(0).unwrap().id, id1);
+
+    // No index is stored as a single Vec any more.
+    env.as_contract(&cid, || {
+        let len: u32 = env
+            .storage()
+            .persistent()
+            .get(&IndexKey::StatusLen(status_code(PaymentStatus::Pending)))
+            .unwrap();
+        assert_eq!(len, 2);
+    });
+}
+
+/// #1458: a single page cannot exceed MAX_PAGE_SIZE.
+#[test]
+fn test_page_size_is_capped() {
+    let (env, cid, requests_client, hospital) = setup();
+    let client = PaymentContractClient::new(&env, &cid);
+    let (_, _, payer, _) = make_payment(&env, &client, &requests_client, &hospital, 100);
+
+    let page = client.get_payments_by_payer(&payer, &0u32, &u32::MAX);
+    assert_eq!(page.page_size, MAX_PAGE_SIZE);
+    assert_eq!(page.items.len(), 1);
+}
+
+/// #1459: duration is bounded, and timestamp overflow is an error rather
+/// than a schedule that vests immediately.
+#[test]
+fn test_vesting_duration_bounded_and_overflow_rejected() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let donor = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &admin, 1_000);
+
+    let result = client.try_create_vesting(
+        &admin,
+        &donor,
+        &token_id,
+        &1_000i128,
+        &0u64,
+        &(MAX_VESTING_DURATION_SECS + 1),
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidVestingSchedule)));
+
+    env.ledger().with_mut(|l| l.timestamp = u64::MAX - 10);
+    let result = client.try_create_vesting(&admin, &donor, &token_id, &1_000i128, &0u64, &1_000u64);
+    assert_eq!(result, Err(Ok(Error::Overflow)));
+    assert!(client.try_get_vesting(&donor).is_err());
+}
+
+/// #1460: with vesting and escrow in the same token, a vesting claim cannot
+/// be paid out of funds that back an open escrow.
+#[test]
+fn test_vesting_claim_cannot_spend_escrowed_funds() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let donor = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&admin, &500);
+    client.add_allowed_token(&admin, &token_id);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+    client.create_vesting(&admin, &donor, &token_id, &500i128, &0u64, &100u64);
+    assert_eq!(client.get_escrow_reserve(&token_id), 1_000);
+    assert_eq!(client.get_vesting_reserve(&token_id), 500);
+
+    // Simulate a shortfall: 600 of the 1_500 held leaves the contract.
+    let token = soroban_sdk::token::Client::new(&env, &token_id);
+    let sink = Address::generate(&env);
+    env.as_contract(&cid, || token.transfer(&cid, &sink, &600));
+
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    let result = client.try_claim_vested(&donor);
+    assert_eq!(result, Err(Ok(Error::InsufficientEscrowFunds)));
+    assert_eq!(token.balance(&cid), 900);
+    assert_eq!(client.get_vesting_reserve(&token_id), 500);
+}
+
+/// #1460: reserves are released as escrows and vesting settle.
+#[test]
+fn test_reserves_track_settlement() {
+    let (env, cid, admin) = setup_with_admin();
+    let client = PaymentContractClient::new(&env, &cid);
+    let hospital = Address::generate(&env);
+    let payee = Address::generate(&env);
+    let donor = Address::generate(&env);
+    let token_id = deploy_token_with_balance(&env, &admin, &hospital, 1_000);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_id).mint(&admin, &500);
+    client.add_allowed_token(&admin, &token_id);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_000);
+    let pid = client.create_escrow(&1u64, &hospital, &payee, &1_000i128, &token_id);
+    client.create_vesting(&admin, &donor, &token_id, &500i128, &0u64, &100u64);
+
+    client.refund_escrow(&admin, &pid);
+    assert_eq!(client.get_escrow_reserve(&token_id), 0);
+
+    env.ledger().with_mut(|l| l.timestamp = 2_000);
+    assert_eq!(client.claim_vested(&donor), 500);
+    assert_eq!(client.get_vesting_reserve(&token_id), 0);
+}

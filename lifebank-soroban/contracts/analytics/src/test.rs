@@ -10,6 +10,11 @@ use super::{
     INSTANCE_BUMP_THRESHOLD, INSTANCE_BUMP_TO,
 };
 
+fn setup<'a>() -> (Env, Address, AnalyticsContractClient<'a>) {
+    let (env, admin, _id, client) = setup_with_id();
+    (env, admin, client)
+}
+
 /// Register and initialize the contract, also returning its contract id so tests
 /// can inspect raw instance-storage TTL via `env.as_contract`.
 fn setup_with_id<'a>() -> (Env, Address, Address, AnalyticsContractClient<'a>) {
@@ -28,11 +33,6 @@ fn setup_with_id<'a>() -> (Env, Address, Address, AnalyticsContractClient<'a>) {
     client.initialize(&admin, &inventory, &requests, &payments, &reputation);
 
     (env, admin, id, client)
-}
-
-fn setup<'a>() -> (Env, Address, AnalyticsContractClient<'a>) {
-    let (env, admin, _id, client) = setup_with_id();
-    (env, admin, client)
 }
 
 // ── Initialization ────────────────────────────────────────────────────────────

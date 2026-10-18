@@ -82,10 +82,6 @@ pub enum BloodComponent {
 
 /// Blood request view returned by the requests contract.
 /// Must match `request_contract::types::BloodRequest` exactly.
-///
-/// Soroban's generated struct decoder requires the decoded map to contain
-/// exactly the locally-declared fields, so every field the requests contract
-/// returns must be declared here (fixes #1453).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct BloodRequest {
@@ -108,8 +104,8 @@ pub struct BloodRequest {
     pub history: Vec<RequestHistoryEntry>,
 }
 
-/// Request lifecycle transition — mirrors requests contract's
-/// `RequestHistoryEntry`. Must match it field-for-field.
+/// Mirrors `request_contract::types::RequestHistoryEntry`. A struct is decoded
+/// field-for-field, so BloodRequest cannot be read without this exact shape.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct RequestHistoryEntry {
