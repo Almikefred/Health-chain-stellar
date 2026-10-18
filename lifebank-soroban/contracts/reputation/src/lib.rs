@@ -488,7 +488,7 @@ impl ReputationContract {
             }
             input.ratings = trimmed;
         }
-        input.last_active_at = timestamp;
+        input.last_active_at = input.last_active_at.max(timestamp);
 
         env.storage().persistent().set(&input_key, &input);
         env.storage()
@@ -548,7 +548,7 @@ impl ReputationContract {
         }
         input.total_response_secs = input.total_response_secs.saturating_add(response_secs);
         input.response_count = input.response_count.saturating_add(1);
-        input.last_active_at = timestamp;
+        input.last_active_at = input.last_active_at.max(timestamp);
 
         env.storage().persistent().set(&input_key, &input);
         env.storage()
@@ -587,7 +587,7 @@ impl ReputationContract {
             .ok_or(Error::EntityNotFound)?;
 
         input.fraud_flags += 1;
-        input.last_active_at = timestamp;
+        input.last_active_at = input.last_active_at.max(timestamp);
         env.storage().persistent().set(&input_key, &input);
         env.storage()
             .persistent()
