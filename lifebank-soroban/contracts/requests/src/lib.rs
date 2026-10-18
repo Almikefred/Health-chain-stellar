@@ -189,6 +189,26 @@ impl RequestContract {
         Ok(())
     }
 
+    /// Assign the authorized rider that is allowed to pick up an Approved request.
+    /// Admin only. May be called again to reassign before pickup.
+    pub fn assign_rider(env: Env, request_id: u64, rider: Address) -> Result<(), ContractError> {
+        storage::require_initialized(&env)?;
+        storage::get_admin(&env).require_auth();
+
+        if !storage::is_rider_authorized(&env, &rider) {
+            return Err(ContractError::NotAuthorizedRider);
+        }
+
+        let request =
+            storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
+        if request.status != RequestStatus::Approved {
+            return Err(ContractError::InvalidRequestStatus);
+        }
+
+        storage::set_request_rider(&env, request_id, &rider);
+        Ok(())
+    }
+
     pub fn create_request(
         env: Env,
         hospital: Address,
@@ -441,6 +461,11 @@ impl RequestContract {
 
         let mut request =
             storage::get_request(&env, request_id).ok_or(ContractError::RequestNotFound)?;
+
+        // A rider may only pick up a request the admin assigned to it.
+        if !is_admin && storage::get_request_rider(&env, request_id) != Some(caller.clone()) {
+            return Err(ContractError::Unauthorized);
+        }
 
         if request.status == new_status {
             return Err(ContractError::InvalidRequestStatus);
