@@ -3,26 +3,6 @@ use crate::types::{
 };
 use soroban_sdk::{contractevent, Address, Env, String};
 
-#[contractevent(topics = ["role_granted"], data_format = "vec")]
-pub struct RoleGranted {
-    pub grantee: Address,
-    pub role: Role,
-    pub granted_by: Address,
-}
-
-#[contractevent(topics = ["role_revoked"], data_format = "vec")]
-pub struct RoleRevoked {
-    pub grantee: Address,
-    pub revoked_by: Address,
-}
-
-#[contractevent(topics = ["invalid_transition"], data_format = "vec")]
-pub struct InvalidTransition {
-    pub blood_unit_id: u64,
-    pub from_status: u32,
-    pub to_status: u32,
-}
-
 #[contractevent(topics = ["blood_reserved"], data_format = "vec")]
 pub struct BloodReserved {
     pub reservation_id: u64,
@@ -81,20 +61,6 @@ pub fn emit_status_change(
         new_status: to_status,
         actor: authorized_by.clone(),
         timestamp: changed_at,
-    }
-    .publish(env);
-}
-
-pub fn emit_invalid_transition(
-    env: &Env,
-    blood_unit_id: u64,
-    from_status: BloodStatus,
-    to_status: BloodStatus,
-) {
-    InvalidTransition {
-        blood_unit_id,
-        from_status: from_status as u32,
-        to_status: to_status as u32,
     }
     .publish(env);
 }
