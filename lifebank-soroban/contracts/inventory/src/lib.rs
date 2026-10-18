@@ -432,6 +432,7 @@ impl InventoryContract {
     pub fn get_units_by_blood_type(env: Env, blood_type: BloodType) -> Vec<u64> {
         let meta_key = DataKey::BloodTypeIndexMeta(blood_type);
         let last_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0u32);
+        storage::extend_page_ttl(&env, &meta_key);
 
         let mut all: Vec<u64> = Vec::new(&env);
         for p in 0..=last_page {
@@ -441,6 +442,7 @@ impl InventoryContract {
                 .persistent()
                 .get(&page_key)
                 .unwrap_or(Vec::new(&env));
+            storage::extend_page_ttl(&env, &page_key);
             for i in 0..page.len() {
                 all.push_back(page.get(i).unwrap());
             }
