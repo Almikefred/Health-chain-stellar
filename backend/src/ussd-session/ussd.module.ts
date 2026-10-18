@@ -1,8 +1,9 @@
-import { Module } from '@nestjs/common';
+import { ForbiddenException, Module } from '@nestjs/common';
 
 import { OrdersModule } from '../orders/orders.module';
 import { OrdersService } from '../orders/orders.service';
 import { RedisModule } from '../redis/redis.module';
+import { UserRepository } from '../users/user.repository';
 import { UsersModule } from '../users/users.module';
 
 import { UssdAuthService } from './ussd-auth.service';
@@ -16,7 +17,10 @@ import { IOrderService, UssdService } from './ussd.service';
  * OrdersService.create() maps to IOrderService.createOrder().
  */
 class OrderServiceAdapter implements IOrderService {
-  constructor(private readonly ordersService: OrdersService) {}
+  constructor(
+    private readonly ordersService: OrdersService,
+    private readonly userRepository: UserRepository,
+  ) {}
 
   async createOrder(params: {
     userId: string;
@@ -25,14 +29,36 @@ class OrderServiceAdapter implements IOrderService {
     bloodBankId: string;
     channel: string;
   }): Promise<{ id: string }> {
+    const user = await this.userRepository.findById(params.userId);
+    if (!user) {
+      throw new ForbiddenException('USSD caller is not associated with an organization');
+    }
+
+    const organizationId = user.organizationId;
+    if (!organizationId) {
+      throw new ForbiddenException('USSD caller is not associated with an organization');
+    }
+
+    const actor = {
+      userId: user.id,
+      role: user.role,
+      organizationId,
+    };
+
     const order = await this.ordersService.create(
       {
         bloodType: params.bloodType,
         quantity: params.quantity,
         bloodBankId: params.bloodBankId,
-        channel: params.channel,
-      } as any,
+        hospitalId: organizationId,
+        deliveryAddress: user.address ?? 'USSD order',
+        geographyCode: user.geographyCode ?? 'USSD',
+        urgencyTier: 'standard',
+        estimatedDistanceKm: 0,
+        serviceLevel: 'standard',
+      },
       params.userId,
+      actor,
     );
     return { id: order.id };
   }
@@ -51,9 +77,9 @@ class OrderServiceAdapter implements IOrderService {
     UssdAuthService,
     {
       provide: IOrderService as unknown as string,
-      useFactory: (ordersService: OrdersService) =>
-        new OrderServiceAdapter(ordersService),
-      inject: [OrdersService],
+      useFactory: (ordersService: OrdersService, userRepository: UserRepository) =>
+        new OrderServiceAdapter(ordersService, userRepository),
+      inject: [OrdersService, UserRepository],
     },
     UssdService,
   ],
