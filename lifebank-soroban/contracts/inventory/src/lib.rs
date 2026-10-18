@@ -232,6 +232,26 @@ impl InventoryContract {
         }
     }
 
+    /// Ensure a delegated Rider / Hospital is the one its owning bank assigned to `unit_id`.
+    /// A grant of the role alone is not enough: without an assignment the caller is rejected.
+    fn assert_delegate_assigned(
+        env: &Env,
+        unit_id: u64,
+        role: &Role,
+        authorized_by: &Address,
+    ) -> Result<(), ContractError> {
+        let assigned: Option<Address> = match role {
+            Role::Rider => env.storage().persistent().get(&DataKey::UnitRider(unit_id)),
+            Role::Hospital => env.storage().persistent().get(&DataKey::UnitHospital(unit_id)),
+            _ => None,
+        };
+        if assigned.as_ref() == Some(authorized_by) {
+            Ok(())
+        } else {
+            Err(ContractError::Unauthorized)
+        }
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), ContractError> {
         if env
             .storage()
@@ -511,7 +531,8 @@ impl InventoryContract {
         //   (b) the caller is the owning blood bank, OR
         //   (c) the caller holds a delegated role (Rider / Hospital) whose
         //       permission to perform this specific transition was already
-        //       confirmed by assert_can_transition above.
+        //       confirmed by assert_can_transition above, and who was assigned
+        //       to this unit by its owning bank (see assert_delegate_assigned).
         //
         // Without branch (c) a granted Rider / Hospital address could never
         // pass this gate because their address is never equal to bank_id,
@@ -519,6 +540,9 @@ impl InventoryContract {
         let delegated_role = matches!(role, Role::Rider | Role::Hospital);
         if role != Role::Admin && authorized_by != blood_unit.bank_id && !delegated_role {
             return Err(ContractError::Unauthorized);
+        }
+        if delegated_role {
+            Self::assert_delegate_assigned(&env, unit_id, &role, &authorized_by)?;
         }
 
         // Reject a blood bank whose authorization has been revoked since it
@@ -583,6 +607,50 @@ impl InventoryContract {
         );
 
         Ok(blood_unit)
+    }
+
+    /// Assign the rider who may move `unit_id` to `InTransit` and the hospital
+    /// that may mark it `Delivered`. Only the blood bank that owns the unit can assign.
+    ///
+    /// # Errors
+    /// - `NotFound`: Blood unit with given ID doesn't exist
+    /// - `NotUnitOwner`: `bank_id` does not own the unit
+    /// - `NotAuthorizedBloodBank`: `bank_id` has been de-authorized
+    pub fn assign_delivery(
+        env: Env,
+        bank_id: Address,
+        unit_id: u64,
+        rider: Address,
+        hospital: Address,
+    ) -> Result<(), ContractError> {
+        bank_id.require_auth();
+        Self::require_not_paused(&env)?;
+
+        let blood_unit = storage::get_blood_unit(&env, unit_id).ok_or(ContractError::NotFound)?;
+        if bank_id != blood_unit.bank_id {
+            return Err(ContractError::NotUnitOwner);
+        }
+        if !storage::is_authorized_bank(&env, &bank_id) {
+            return Err(ContractError::NotAuthorizedBloodBank);
+        }
+
+        let rider_key = DataKey::UnitRider(unit_id);
+        env.storage().persistent().set(&rider_key, &rider);
+        env.storage().persistent().extend_ttl(
+            &rider_key,
+            storage::TTL_THRESHOLD,
+            storage::TTL_EXTEND_TO,
+        );
+
+        let hospital_key = DataKey::UnitHospital(unit_id);
+        env.storage().persistent().set(&hospital_key, &hospital);
+        env.storage().persistent().extend_ttl(
+            &hospital_key,
+            storage::TTL_THRESHOLD,
+            storage::TTL_EXTEND_TO,
+        );
+
+        Ok(())
     }
 
     pub fn mark_delivered(
