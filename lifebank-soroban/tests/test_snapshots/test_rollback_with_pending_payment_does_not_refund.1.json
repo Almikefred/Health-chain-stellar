@@ -65,6 +65,13 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                },
+                {
+                  "vec": [
+                    {
+                      "symbol": "OPositive"
+                    }
+                  ]
                 }
               ]
             }
@@ -344,6 +351,18 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "blood_type"
+                      },
+                      "val": {
+                        "vec": [
+                          {
+                            "symbol": "OPositive"
+                          }
+                        ]
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "id"
                       },
                       "val": {
@@ -594,6 +613,20 @@
                     },
                     {
                       "key": {
+                        "symbol": "delivery_location"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
+                        "symbol": "expires_at"
+                      },
+                      "val": {
+                        "u64": "21600"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "payment_id"
                       },
                       "val": {
@@ -638,7 +671,7 @@
             },
             "ext": "v0"
           },
-          4095
+          535680
         ]
       ],
       [

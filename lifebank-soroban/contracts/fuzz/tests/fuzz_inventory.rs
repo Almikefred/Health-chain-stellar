@@ -121,7 +121,7 @@ proptest! {
         // Should either succeed (valid quantity) or return InvalidQuantity error
         match result {
             Ok(_) => {
-                assert!(quantity >= 100 && quantity <= 600, "Invalid quantity accepted");
+                assert!((100..=600).contains(&quantity), "Invalid quantity accepted");
             }
             Err(_) => {
                 // Expected for out-of-range quantities
@@ -155,7 +155,7 @@ proptest! {
             all_unit_ids.push_back(unit_id);
         }
 
-        if all_unit_ids.len() > 0 {
+        if !all_unit_ids.is_empty() {
             // Create batch reservation request
             let mut batch = SorobanVec::new(&env);
             batch.push_back((all_unit_ids, 1u64, 3600u64));

@@ -169,32 +169,6 @@ pub struct PendingApproval {
     pub executed: bool,
 }
 
-impl PendingApproval {
-    /// Creates an empty approval record for `payment_id`.
-    pub fn new(env: &soroban_sdk::Env, payment_id: u64) -> Self {
-        Self {
-            payment_id,
-            approvals: Vec::new(env),
-            executed: false,
-        }
-    }
-
-    /// Records `approver`'s vote. Returns `Err(())` if the approver has
-    /// already voted, so callers can surface `Error::DuplicateApproval`.
-    pub fn register_vote(&mut self, approver: Address) -> Result<(), ()> {
-        if self.approvals.contains(&approver) {
-            return Err(());
-        }
-        self.approvals.push_back(approver);
-        Ok(())
-    }
-
-    /// Returns `true` once the number of distinct approvals meets `threshold`.
-    pub fn has_reached_threshold(&self, threshold: u32) -> bool {
-        self.approvals.len() >= threshold
-    }
-}
-
 /// Fee breakdown for a transaction
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,6 +233,216 @@ impl Payment {
 
         Ok(())
     }
-    /// Checks if payment can tra
+    /// Checks if payment can transition to a new status
+    pub fn can_transition_to(&self, new_status: PaymentStatus) -> bool {
+        match (self.status, new_status) {
+            // Pending can go to Escrowed or Cancelled
+            (PaymentStatus::Pending, PaymentStatus::Escrowed) => true,
+            (PaymentStatus::Pending, PaymentStatus::Cancelled) => true,
 
-/* … truncated 7221 chars — edit only what you need near the top … */
+            // Escrowed can go to Completed, Refunded or Disputed
+            (PaymentStatus::Escrowed, PaymentStatus::Completed) => true,
+            (PaymentStatus::Escrowed, PaymentStatus::Refunded) => true,
+            (PaymentStatus::Escrowed, PaymentStatus::Disputed) => true,
+
+            // Disputed can go to Resolved
+            (PaymentStatus::Disputed, PaymentStatus::Resolved) => true,
+
+            // Resolved can go to Completed or Refunded
+            (PaymentStatus::Resolved, PaymentStatus::Completed) => true,
+            (PaymentStatus::Resolved, PaymentStatus::Refunded) => true,
+
+            // Terminal states cannot transition
+            (PaymentStatus::Completed, _) => false,
+            (PaymentStatus::Refunded, _) => false,
+            (PaymentStatus::Cancelled, _) => false,
+
+            // All other transitions are invalid
+            _ => false,
+        }
+    }
+
+    /// Checks if the payment is in a terminal state
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            PaymentStatus::Completed | PaymentStatus::Refunded | PaymentStatus::Cancelled
+        )
+    }
+}
+
+impl EscrowAccount {
+    /// Validates escrow account structure
+    pub fn validate(&self) -> Result<(), PaymentError> {
+        if self.locked_amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        Ok(())
+    }
+
+    /// Checks if release conditions are satisfied
+    pub fn can_release(&self, current_timestamp: u64, approver: Option<&Address>) -> bool {
+        // Check timestamp condition
+        if current_timestamp < self.release_conditions.min_timestamp {
+            return false;
+        }
+
+        // Check medical records verification
+        if !self.release_conditions.medical_records_verified {
+            return false;
+        }
+
+        // Check approver if required
+        if let Some(required_approver) = &self.release_conditions.authorized_approver {
+            if let Some(provided_approver) = approver {
+                if required_approver != provided_approver {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl MultiSigConfig {
+    pub fn validate(&self) -> Result<(), PaymentError> {
+        if self.signers.is_empty() || self.threshold == 0 {
+            return Err(PaymentError::InvalidMultiSigConfig);
+        }
+
+        if self.threshold > self.signers.len() {
+            return Err(PaymentError::InvalidMultiSigConfig);
+        }
+
+        for i in 0..self.signers.len() {
+            let signer = self.signers.get(i).unwrap();
+            for j in (i + 1)..self.signers.len() {
+                if signer == self.signers.get(j).unwrap() {
+                    return Err(PaymentError::InvalidMultiSigConfig);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn is_signer(&self, approver: &Address) -> bool {
+        self.signers.contains(approver.clone())
+    }
+}
+
+impl PendingApproval {
+    pub fn new(env: &soroban_sdk::Env, payment_id: u64) -> Self {
+        Self {
+            payment_id,
+            approvals: Vec::new(env),
+            executed: false,
+        }
+    }
+
+    pub fn has_voted(&self, approver: &Address) -> bool {
+        self.approvals.contains(approver.clone())
+    }
+
+    pub fn register_vote(&mut self, approver: Address) -> Result<(), PaymentError> {
+        if self.has_voted(&approver) {
+            return Err(PaymentError::DuplicateApproval);
+        }
+
+        self.approvals.push_back(approver);
+        Ok(())
+    }
+
+    pub fn has_reached_threshold(&self, threshold: u32) -> bool {
+        self.approvals.len() >= threshold
+    }
+}
+
+impl FeeStructure {
+    /// Calculates total fees, returning Err if any intermediate sum overflows i128.
+    pub fn total(&self) -> Result<i128, PaymentError> {
+        self.service_fee
+            .checked_add(self.network_fee)
+            .and_then(|v| v.checked_add(self.performance_bonus))
+            .and_then(|v| v.checked_add(self.fixed_fee))
+            .ok_or(PaymentError::Overflow)
+    }
+
+    /// Validates fee structure
+    pub fn validate(&self) -> Result<(), PaymentError> {
+        if self.service_fee < 0
+            || self.network_fee < 0
+            || self.performance_bonus < 0
+            || self.fixed_fee < 0
+        {
+            return Err(PaymentError::InvalidFee);
+        }
+        Ok(())
+    }
+
+    /// Calculates net amount after deducting fees
+    pub fn calculate_net_amount(&self, gross_amount: i128) -> Result<i128, PaymentError> {
+        self.validate()?;
+        let total_fees = self.total()?;
+        if total_fees > gross_amount {
+            return Err(PaymentError::FeesExceedAmount);
+        }
+        Ok(gross_amount - total_fees)
+    }
+
+    /// Validates that total fees do not exceed `MAX_FEE_BPS` of the gross amount.
+    ///
+    /// Fee-structuring attack (issue #1400): an attacker can supply a large fee
+    /// payload so that the stored net `payment.amount` falls just under
+    /// `HIGH_VALUE_THRESHOLD`, causing `propose_release` to skip the M-of-N
+    /// multisig check even though the escrowed gross amount is far above the
+    /// threshold.  This method must be called at payment-creation time to close
+    /// that attack surface before the escrow record is written.
+    ///
+    /// `gross_amount` must be the raw amount supplied by the payer (before any
+    /// fee deduction).
+    pub fn validate_fee_cap(&self, gross_amount: i128) -> Result<(), PaymentError> {
+        if gross_amount <= 0 {
+            return Err(PaymentError::InvalidAmount);
+        }
+        let total_fees = self.total()?;
+        // total_fees / gross_amount <= MAX_FEE_BPS / 10_000
+        // ⟺  total_fees * 10_000 <= MAX_FEE_BPS * gross_amount
+        // Use only integer arithmetic to avoid floating-point inaccuracy.
+        let lhs = total_fees
+            .checked_mul(10_000)
+            .ok_or(PaymentError::Overflow)?;
+        let rhs = crate::payments::MAX_FEE_BPS
+            .checked_mul(gross_amount)
+            .ok_or(PaymentError::Overflow)?;
+        if lhs > rhs {
+            return Err(PaymentError::FeesExceedCap);
+        }
+        Ok(())
+    }
+}
+
+/// Error types for payment operations
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentError {
+    InvalidAmount,
+    SamePayerPayee,
+    InvalidFee,
+    InvalidAsset,
+    FeesExceedAmount,
+    InvalidTransition,
+    EscrowNotReleasable,
+    InvalidMultiSigConfig,
+    DuplicateApproval,
+    Overflow,
+    /// Total fees exceed the MAX_FEE_BPS cap as a fraction of the gross amount.
+    ///
+    /// Raised by `FeeStructure::validate_fee_cap` to prevent fee-structuring
+    /// attacks that would reduce the stored net `payment.amount` below
+    /// `HIGH_VALUE_THRESHOLD` while locking a far larger gross amount in escrow.
+    FeesExceedCap,
+}
