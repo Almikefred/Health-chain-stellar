@@ -26,6 +26,17 @@ pub fn extend_instance_ttl(env: &Env) {
         .extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
+/// Extend a persistent index/history entry when it exists. Full-scan reads call
+/// this so pages that are never written again stay live while still being read.
+/// Skips missing keys because `extend_ttl` traps on an absent entry.
+pub fn extend_page_ttl(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+}
+
 /// Maximum history entries per storage page. Keeps each page small so
 /// a single read never loads the entire history of a high-traffic unit.
 const HISTORY_PAGE_SIZE: u32 = 50;
@@ -271,6 +282,7 @@ pub fn remove_from_status_index(env: &Env, blood_unit_id: u64, old_status: Blood
 fn remove_from_status_index_scan(env: &Env, blood_unit_id: u64, old_status: BloodStatus) {
     let meta_key = DataKey::StatusIndexMeta(old_status);
     let last_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0);
+    extend_page_ttl(env, &meta_key);
 
     for p in 0..=last_page {
         let page_key = DataKey::StatusIndexPage(old_status, p);
@@ -279,6 +291,7 @@ fn remove_from_status_index_scan(env: &Env, blood_unit_id: u64, old_status: Bloo
             .persistent()
             .get(&page_key)
             .unwrap_or(Vec::new(env));
+        extend_page_ttl(env, &page_key);
 
         let mut updated: Vec<u64> = Vec::new(env);
         let mut found = false;
@@ -417,6 +430,7 @@ pub fn record_status_change(
 pub fn get_status_history(env: &Env, blood_unit_id: u64) -> Vec<StatusChangeHistory> {
     let page_key = DataKey::StatusHistory(blood_unit_id);
     let last_page: u32 = env.storage().persistent().get(&page_key).unwrap_or(0);
+    extend_page_ttl(env, &page_key);
 
     let mut all: Vec<StatusChangeHistory> = Vec::new(env);
     for p in 0..=last_page {
@@ -426,6 +440,7 @@ pub fn get_status_history(env: &Env, blood_unit_id: u64) -> Vec<StatusChangeHist
             .persistent()
             .get(&page_data_key)
             .unwrap_or(Vec::new(env));
+        extend_page_ttl(env, &page_data_key);
         for i in 0..page.len() {
             all.push_back(page.get(i).unwrap());
         }
