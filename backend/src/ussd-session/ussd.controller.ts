@@ -1,67 +1,78 @@
 import {
-  Controller,
-  Post,
   Body,
-  Res,
+  Controller,
+  Headers,
   HttpCode,
   HttpStatus,
-  Logger,
-  UsePipes,
-  ValidationPipe,
+  Ip,
+  Post,
+  UnauthorizedException,
 } from '@nestjs/common';
-import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { timingSafeEqual } from 'crypto';
 
-import { UssdSessionDto } from './ussd.dto';
+import { Public } from '../auth/decorators/public.decorator';
+
 import { UssdService } from './ussd.service';
-import { UssdRequest } from './ussd.types';
 
-import type { Response } from 'express';
-
+/**
+ * Africa's Talking USSD gateway callback.
+ *
+ * The gateway posts a form-encoded body with no Authorization header, so the
+ * route is marked @Public() to bypass the global JwtAuthGuard. Instead of JWT
+ * we authenticate the gateway via an allow-list of source IPs and/or a shared
+ * secret in the callback URL (compared in constant time). The per-user PIN
+ * check remains inside the USSD state machine.
+ */
 @ApiTags('USSD')
 @Throttle({ default: { limit: 5, ttl: 60_000 } })
 @Controller('ussd')
 export class UssdController {
-  private readonly logger = new Logger(UssdController.name);
-
   constructor(private readonly ussdService: UssdService) {}
 
-  /**
-   * Africa's Talking USSD gateway callback endpoint.
-   * Africa's Talking sends a form-encoded POST and expects a plain-text response
-   * prefixed with CON (continue session) or END (terminate session).
-   */
+  @Public()
   @Post('session')
   @HttpCode(HttpStatus.OK)
-  @UsePipes(
-    new ValidationPipe({
-      transform: true,
-      whitelist: true,
-      forbidNonWhitelisted: true,
-    }),
-  )
-  @ApiOperation({ summary: "Handle Africa's Talking USSD session callback" })
-  @ApiResponse({
-    status: 200,
-    description: 'USSD response text (CON/END prefixed)',
-  })
+  @ApiOperation({ summary: "Africa's Talking USSD session callback" })
   async handleSession(
-    @Body() dto: UssdSessionDto,
-    @Res() res: Response,
-  ): Promise<void> {
-    const request: UssdRequest = {
-      sessionId: dto.sessionId,
-      serviceCode: dto.serviceCode,
-      phoneNumber: dto.phoneNumber,
-      text: dto.text,
-      networkCode: dto.networkCode,
-      operator: dto.operator,
-    };
+    @Body() body: Record<string, string>,
+    @Ip() ip: string,
+    @Headers('x-ussd-secret') headerSecret?: string,
+  ): Promise<string> {
+    this.assertGatewayAuthenticated(ip, body, headerSecret);
+    return this.ussdService.handleSession(body);
+  }
 
-    const { type, message } = await this.ussdService.handleSession(request);
+  private assertGatewayAuthenticated(
+    ip: string,
+    body: Record<string, string>,
+    headerSecret?: string,
+  ): void {
+    const allowedIps = (process.env.USSD_ALLOWED_IPS ?? '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const sharedSecret = process.env.USSD_CALLBACK_SECRET;
 
-    // Africa's Talking expects plain text: "CON <message>" or "END <message>"
-    res.setHeader('Content-Type', 'text/plain');
-    res.send(`${type} ${message}`);
+    const ipAllowed = allowedIps.length > 0 && allowedIps.includes(ip);
+    const providedSecret = headerSecret ?? body?.secret;
+    const secretValid =
+      !!sharedSecret &&
+      !!providedSecret &&
+      this.safeEqual(sharedSecret, providedSecret);
+
+    if (!ipAllowed && !secretValid) {
+      throw new UnauthorizedException('Invalid USSD gateway credentials');
+    }
+  }
+
+  private safeEqual(expected: string, provided: string): boolean {
+    const expectedBuf = Buffer.from(expected);
+    const providedBuf = Buffer.from(provided);
+    if (expectedBuf.length !== providedBuf.length) {
+      return false;
+    }
+    return timingSafeEqual(expectedBuf, providedBuf);
   }
 }

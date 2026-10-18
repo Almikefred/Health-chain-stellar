@@ -93,4 +93,9 @@ describe('UssdController', () => {
       }),
     );
   });
+
+  it('is marked @Public() so the global JWT guard skips the gateway callback', () => {
+    const isPublic = Reflect.getMetadata('isPublic', UssdController.prototype.handleSession);
+    expect(isPublic).toBe(true);
+  });
 });
