@@ -132,3 +132,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1646 -->
 - #1646: [lifebank/temperature] set_threshold lets the admin bypass the 7-day threshold-change timelock entirely
+
+<!-- handsoff-issue-1647 -->
+- #1647: [lifebank/temperature] report_excursion_to_coordinator never binds payment_id to unit_id, so any oracle can dispute any payment by citing any unit with a past violation
