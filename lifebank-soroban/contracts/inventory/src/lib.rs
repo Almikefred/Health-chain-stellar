@@ -1015,6 +1015,34 @@ impl InventoryContract {
         Ok(())
     }
 
+    /// Expire a reservation whose `expiration_timestamp` has passed, returning
+    /// all of its units to `Available`.
+    ///
+    /// Permissionless, so units stranded in `Reserved` can be recovered without
+    /// per-unit admin action. Expired reservations remain in storage for a grace
+    /// period (see `storage::set_reservation`), so this can be called any time
+    /// after expiry.
+    ///
+    /// # Errors
+    /// - `Paused` if the contract is paused
+    /// - `ReservationNotFound` if reservation does not exist
+    /// - `ReservationNotExpired` if the reservation has not yet expired
+    pub fn expire_reservation(env: Env, reservation_id: u64) -> Result<(), ContractError> {
+        Self::require_not_paused(&env)?;
+
+        let reservation = storage::get_reservation(&env, reservation_id)
+            .ok_or(ContractError::ReservationNotFound)?;
+
+        if env.ledger().timestamp() < reservation.expiration_timestamp {
+            return Err(ContractError::ReservationNotExpired);
+        }
+
+        let contract_address = env.current_contract_address();
+        Self::release_reservation_internal(&env, &reservation, reservation_id, &contract_address)?;
+
+        Ok(())
+    }
+
     /// Shared internal logic for releasing a reservation.
     /// `caller` is the address that actually triggered the release (admin,
     /// reserver, or requests contract) and is recorded in the audit trail
