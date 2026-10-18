@@ -124,8 +124,14 @@ For contract deployment, full environment variable reference, and contributor gu
 <!-- handsoff-issue-1482 -->
 - #1482: [lifebank/temperature] compute_excursion_data trusts stale is_violation flags computed under a historical threshold instead of re-validating against the current one
 
-<!-- handsoff-issue-1652 -->
-- #1652: [lifebank] Only the coordinator supports admin transfer; the other nine contracts have a permanently fixed admin key
+<!-- handsoff-issue-1644 -->
+- #1644: [lifebank/reputation] update_from_event treats every lost dispute as confirmed fraud, and event kinds 0 and 1 are identical
 
-<!-- handsoff-issue-1653 -->
-- #1653: [lifebank] Six of ten contracts have no upgrade() entrypoint (analytics, coordinator, delivery, identity, matching, reputation)
+<!-- handsoff-issue-1645 -->
+- #1645: [lifebank/reputation] calculate_reputation is an unauthenticated public write that ignores pause, and get_score returns stale scores that never include decay
+
+<!-- handsoff-issue-1646 -->
+- #1646: [lifebank/temperature] set_threshold lets the admin bypass the 7-day threshold-change timelock entirely
+
+<!-- handsoff-issue-1647 -->
+- #1647: [lifebank/temperature] report_excursion_to_coordinator never binds payment_id to unit_id, so any oracle can dispute any payment by citing any unit with a past violation
