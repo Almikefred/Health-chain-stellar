@@ -10,7 +10,7 @@ import { UssdAuthService } from './ussd-auth.service';
 import { UssdSessionStore } from './ussd-session.store';
 import { UssdStateMachine } from './ussd-state-machine.service';
 import { UssdController } from './ussd.controller';
-import { IOrderService, UssdService } from './ussd.service';
+import { IOrderService, ORDER_SERVICE, UssdService } from './ussd.service';
 
 /**
  * Adapts OrdersService to the IOrderService interface expected by UssdService.
@@ -76,7 +76,7 @@ class OrderServiceAdapter implements IOrderService {
     UssdSessionStore,
     UssdAuthService,
     {
-      provide: IOrderService as unknown as string,
+      provide: ORDER_SERVICE,
       useFactory: (ordersService: OrdersService, userRepository: UserRepository) =>
         new OrderServiceAdapter(ordersService, userRepository),
       inject: [OrdersService, UserRepository],
