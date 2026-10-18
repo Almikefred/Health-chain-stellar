@@ -297,6 +297,9 @@ pub enum DataKey {
     BloodTypeIndexPage(BloodType, u32),
     StatusIndexPage(BloodStatus, u32),
 
+    /// Position of a blood unit inside its status index: blood_unit_id -> (page, slot)
+    StatusIndexSlot(u64),
+
     /// Authorized blood bank address
     AuthorizedBank(Address),
 

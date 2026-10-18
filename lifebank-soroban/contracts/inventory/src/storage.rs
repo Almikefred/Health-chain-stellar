@@ -214,18 +214,61 @@ pub fn add_to_status_index(env: &Env, blood_unit: &BloodUnit) {
         env.storage()
             .persistent()
             .extend_ttl(&new_page_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        set_status_index_slot(env, blood_unit.id, next_page, 0);
     } else {
+        let slot = page.len();
         page.push_back(blood_unit.id);
         env.storage().persistent().set(&page_key, &page);
         env.storage()
             .persistent()
             .extend_ttl(&page_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        set_status_index_slot(env, blood_unit.id, current_page, slot);
     }
 }
 
-/// Remove a single ID from a status index bucket.
-/// Scans all pages until the ID is found, rebuilds that page without it.
+fn set_status_index_slot(env: &Env, blood_unit_id: u64, page: u32, slot: u32) {
+    let slot_key = DataKey::StatusIndexSlot(blood_unit_id);
+    env.storage().persistent().set(&slot_key, &(page, slot));
+    env.storage()
+        .persistent()
+        .extend_ttl(&slot_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Remove a single ID from a status index bucket in O(1) reads.
+/// The unit's (page, slot) position is looked up directly and the hole is
+/// filled by swap-removing the page's last element.
+/// Units indexed before positions were tracked fall back to a page scan.
 pub fn remove_from_status_index(env: &Env, blood_unit_id: u64, old_status: BloodStatus) {
+    let slot_key = DataKey::StatusIndexSlot(blood_unit_id);
+    let (page, slot): (u32, u32) = match env.storage().persistent().get(&slot_key) {
+        Some(position) => position,
+        None => return remove_from_status_index_scan(env, blood_unit_id, old_status),
+    };
+
+    let page_key = DataKey::StatusIndexPage(old_status, page);
+    let mut units: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&page_key)
+        .unwrap_or(Vec::new(env));
+
+    let last_slot = units.len() - 1;
+    if slot != last_slot {
+        let moved_id = units.get(last_slot).unwrap();
+        units.set(slot, moved_id);
+        set_status_index_slot(env, moved_id, page, slot);
+    }
+    units.pop_back();
+
+    env.storage().persistent().set(&page_key, &units);
+    env.storage()
+        .persistent()
+        .extend_ttl(&page_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    env.storage().persistent().remove(&slot_key);
+}
+
+/// Legacy removal for units with no recorded slot: scans all pages from 0.
+fn remove_from_status_index_scan(env: &Env, blood_unit_id: u64, old_status: BloodStatus) {
     let meta_key = DataKey::StatusIndexMeta(old_status);
     let last_page: u32 = env.storage().persistent().get(&meta_key).unwrap_or(0);
 
