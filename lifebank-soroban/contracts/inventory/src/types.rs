@@ -324,6 +324,12 @@ pub enum DataKey {
     /// Reservation counter
     ReservationCounter,
 
+    /// Rider assigned by the owning bank to move a unit (blood_unit_id -> Address)
+    UnitRider(u64),
+
+    /// Hospital assigned by the owning bank as the destination of a unit (blood_unit_id -> Address)
+    UnitHospital(u64),
+
     /// Circuit breaker: contract is paused
     Paused,
 
