@@ -12,10 +12,10 @@ const MAX_SCORE: i64 = 10_000;
 const MIN_SCORE: i64 = 0;
 
 /// Weights applied to each score component
-const W_RATING: i64 = 35; // weighted average rating
-const W_COMPLETION: i64 = 25; // completion rate
+const W_RATING: i64 = 40; // weighted average rating
+const W_COMPLETION: i64 = 30; // completion rate
 const W_RESPONSE: i64 = 20; // response time
-const W_CONSISTENCY: i64 = 10; // consistency bonus
+const W_CONSISTENCY: i64 = 10; // consistency bonus (sums with the above to 100)
 
 /// Decay: score loses 1 point per DECAY_PERIOD_SECS of inactivity
 const DECAY_PERIOD_SECS: u64 = 30 * 24 * 3600; // 30 days
@@ -30,8 +30,8 @@ const MAX_FRAUD_PENALTY: i64 = 5_000; // cap total fraud penalty
 
 /// Consistency bonus: awarded when std-dev of ratings is low
 const CONSISTENCY_LOW_STDDEV: i64 = 50; // ×100 → 0.50 stars
-const CONSISTENCY_BONUS_HIGH: i64 = 10_00;
-const CONSISTENCY_BONUS_MED: i64 = 5_00;
+const CONSISTENCY_BONUS_HIGH: i64 = 10_000;
+const CONSISTENCY_BONUS_MED: i64 = 5_000;
 
 /// Penalty points per violation type
 const PENALTY_MINOR: i64 = 5_00;
@@ -781,9 +781,9 @@ impl ReputationContract {
     ///
     /// Score breakdown (all values ×100):
     ///
-    /// 1. **Weighted rating** (35%): recency-weighted average of rating events,
+    /// 1. **Weighted rating** (40%): recency-weighted average of rating events,
     ///    normalised to 0–100.
-    /// 2. **Completion rate** (25%): `completed / assigned × 100`.
+    /// 2. **Completion rate** (30%): `completed / assigned × 100`.
     /// 3. **Response time** (20%): faster average → higher score (capped at 1 h).
     /// 4. **Consistency bonus** (10%): low std-dev of ratings → bonus.
     /// 5. **Fraud penalty** (10%): deducted per confirmed fraud flag.
