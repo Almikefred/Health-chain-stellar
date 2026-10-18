@@ -186,6 +186,7 @@ pub struct Organization {
     pub verified_timestamp: Option<u64>,
     pub rating: u32,
     pub total_ratings: u32,
+    pub rating_sum: u64,
     pub location_hash: BytesN<32>,
 }
 
@@ -495,6 +496,7 @@ impl IdentityContract {
             verified_timestamp: None,
             rating: 0,
             total_ratings: 0,
+            rating_sum: 0,
             location_hash,
         };
 
@@ -809,9 +811,10 @@ impl IdentityContract {
             .get(&org_key)
             .ok_or(Error::OrganizationNotFound)?;
 
-        let total_rating = organization.rating * organization.total_ratings;
+        // Accumulate the exact sum so the floored average never feeds back into future updates
+        organization.rating_sum += rating as u64;
         organization.total_ratings += 1;
-        organization.rating = (total_rating + rating) / organization.total_ratings;
+        organization.rating = (organization.rating_sum / organization.total_ratings as u64) as u32;
 
         env.storage().persistent().set(&org_key, &organization);
         env.storage()
