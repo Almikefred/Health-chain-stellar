@@ -1005,13 +1005,8 @@ impl CoordinatorContract {
         payment_id: u64,
         excursion_summary: ExcursionSummary,
     ) -> Result<(), CoordinatorError> {
+        let caller = env.current_contract_address();
         caller.require_auth();
-        Self::require_initialized(&env)?;
-        Self::require_not_paused(&env)?;
-        Self::require_oracle(&env, &caller)?;
-
-        let pay_addr: Address = get_contract_address(&env, &DataKey::PaymentContract)?;
-        let pay_client = PaymentContractClient::new(&env, &pay_addr);
 
         let payment = pay_client
             .try_get_payment(&payment_id)
@@ -1024,15 +1019,12 @@ impl CoordinatorContract {
 
         let case_id = String::from_str(&env, "TEMP-EXCURSION");
 
-        pay_client
-            .try_record_dispute(
-                &payment_id,
-                &payment_client::DisputeReason::TemperatureExcursion,
-                &case_id,
-                &env.current_contract_address(),
-            )
-            .map_err(|_| CoordinatorError::PaymentFlagFailed)?
-            .map_err(|_| CoordinatorError::PaymentFlagFailed)?;
+        payment_client.record_dispute(
+            &payment_id,
+            &payment_client::DisputeReason::TemperatureExcursion,
+            &String::from_str(&env, "temperature-breach"),
+            &caller,
+        );
 
         let now = env.ledger().timestamp();
         CoordTemperatureBreach {
