@@ -977,10 +977,16 @@ fn test_record_assignment_saturates_response_seconds() {
 
     let huge = u64::MAX;
     let first = c.try_record_assignment(&admin, &ENTITY, &true, &huge, &1000u64);
-    assert!(first.is_ok(), "first record_assignment should not panic or overflow");
+    assert!(
+        first.is_ok(),
+        "first record_assignment should not panic or overflow"
+    );
 
     let second = c.try_record_assignment(&admin, &ENTITY, &false, &1u64, &1000u64);
-    assert!(second.is_ok(), "subsequent record_assignment should also saturate safely");
+    assert!(
+        second.is_ok(),
+        "subsequent record_assignment should also saturate safely"
+    );
 
     let input = c.get_input(&ENTITY).unwrap();
     assert_eq!(input.total_response_secs, u64::MAX);
@@ -1031,7 +1037,7 @@ fn test_penalty_ids_remain_unique_after_trim_cycles() {
         env.ledger().with_mut(|l| l.timestamp = 1000 + i as u64);
         c.apply_penalty(&ENTITY, &ViolationType::Minor);
         let input = c.get_input(&ENTITY).unwrap();
-        if input.penalties.len() > 0 {
+        if !input.penalties.is_empty() {
             let p = input.penalties.get(input.penalties.len() - 1).unwrap();
             penalty_ids.push(p.id);
         }
@@ -1076,7 +1082,10 @@ fn test_ttl_extends_on_persistent_access() {
 
     // Seed entity with rating
     c.submit_rating(&admin, &ENTITY, &5i64, &1000u64);
-    assert!(c.get_score(&ENTITY).is_some(), "Score should exist after rating");
+    assert!(
+        c.get_score(&ENTITY).is_some(),
+        "Score should exist after rating"
+    );
 
     // Access should extend TTL (no panic or error)
     env.ledger().with_mut(|l| l.timestamp = 2000);
@@ -1086,7 +1095,10 @@ fn test_ttl_extends_on_persistent_access() {
     // Record assignment should extend TTL
     c.record_assignment(&admin, &ENTITY, &true, &300u64, &2000u64);
     let input = c.get_input(&ENTITY);
-    assert!(input.is_some(), "Input should still be accessible after record_assignment");
+    assert!(
+        input.is_some(),
+        "Input should still be accessible after record_assignment"
+    );
 
     // Apply penalty should extend TTL
     env.ledger().with_mut(|l| l.timestamp = 3000);
@@ -1101,5 +1113,139 @@ fn test_ttl_extends_on_persistent_access() {
     env.ledger().with_mut(|l| l.timestamp = 4000);
     c.flag_fraud(&admin, &ENTITY, &4000u64);
     let input = c.get_input(&ENTITY);
-    assert!(input.is_some(), "Input should still be accessible after flag_fraud");
+    assert!(
+        input.is_some(),
+        "Input should still be accessible after flag_fraud"
+    );
+}
+
+// ── #1606 regressions ─────────────────────────────────────────────────────────
+
+/// #1461: resolve_penalty is a state-mutating call and must honour pause.
+#[test]
+fn test_resolve_penalty_blocked_when_paused() {
+    let (env, cid) = setup();
+    let c = client(&env, &cid);
+    let admin = Address::generate(&env);
+    c.init(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    c.submit_rating(&admin, &ENTITY, &5, &1000);
+    c.apply_penalty(&ENTITY, &ViolationType::Medium);
+
+    c.pause(&admin);
+    assert_eq!(
+        c.try_resolve_penalty(&ENTITY, &0, &true),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(c.get_input(&ENTITY).unwrap().penalties.len(), 1);
+}
+
+/// #1462: an appeal changes the score — the appealed penalty counts at half
+/// weight until it is resolved.
+#[test]
+fn test_appealed_penalty_counts_at_half_weight() {
+    let (env, cid) = setup();
+    let c = client(&env, &cid);
+    let admin = Address::generate(&env);
+    c.init(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    c.submit_rating(&admin, &ENTITY, &5, &1000);
+
+    let before = c.apply_penalty(&ENTITY, &ViolationType::Serious);
+    assert_eq!(before.penalty_points, PENALTY_SERIOUS);
+
+    c.appeal_penalty(&admin, &ENTITY, &0);
+    let after = c.calculate_reputation(&ENTITY);
+    assert_eq!(after.penalty_points, PENALTY_SERIOUS / 2);
+    assert!(after.score > before.score);
+}
+
+/// #1463: scoring reads the stored configs instead of hard-coded constants.
+#[test]
+fn test_scoring_uses_stored_configs() {
+    let (env, cid) = setup();
+    let c = client(&env, &cid);
+    let admin = Address::generate(&env);
+    c.init(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    // Rating scale: 10 is rejected by default, accepted on a 1–10 scale, and
+    // a 10 on that scale is a perfect rating.
+    assert_eq!(
+        c.try_submit_rating(&admin, &ENTITY, &10, &1000),
+        Err(Ok(Error::InvalidRating))
+    );
+    c.set_rating_scale_config(
+        &admin,
+        &RatingScaleConfig {
+            min_rating: 1,
+            max_rating: 10,
+        },
+    );
+    let s = c.submit_rating(&admin, &ENTITY, &10, &1000);
+    assert_eq!(s.rating_component, 10_000);
+
+    // Decay: a 1-day period with a 5-point cap decays 5 points after a week.
+    c.set_decay_config(
+        &admin,
+        &DecayConfig {
+            decay_period_secs: DAY,
+            max_decay: 5_00,
+            rating_half_life_secs: HALF_LIFE_SECS,
+        },
+    );
+    env.ledger().with_mut(|l| l.timestamp = 1000 + 7 * DAY);
+    assert_eq!(c.calculate_reputation(&ENTITY).decay_applied, 5_00);
+}
+
+#[test]
+fn test_config_setters_validate_and_require_admin() {
+    let (env, cid) = setup();
+    let c = client(&env, &cid);
+    let admin = Address::generate(&env);
+    c.init(&admin);
+    let other = Address::generate(&env);
+
+    let scale = RatingScaleConfig {
+        min_rating: 1,
+        max_rating: 10,
+    };
+    assert_eq!(
+        c.try_set_rating_scale_config(&other, &scale),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        c.try_set_rating_scale_config(
+            &admin,
+            &RatingScaleConfig {
+                min_rating: 5,
+                max_rating: 5
+            }
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        c.try_set_decay_config(
+            &admin,
+            &DecayConfig {
+                decay_period_secs: 0,
+                max_decay: MAX_DECAY,
+                rating_half_life_secs: HALF_LIFE_SECS
+            }
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn test_update_from_event_records_assignment() {
+    let (env, cid) = setup();
+    let c = client(&env, &cid);
+    let admin = Address::generate(&env);
+    c.init(&admin);
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    c.update_from_event(&admin, &0u32, &ENTITY, &true, &60u64, &1000u64);
+    let input = c.get_input(&ENTITY).unwrap();
+    assert_eq!(input.total_completed, 1);
 }

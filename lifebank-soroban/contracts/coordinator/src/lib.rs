@@ -4,12 +4,20 @@
 /// Cross-contract coordinator for the HealthDonor workflow.
 ///
 /// Canonical workflow sequence enforced here:
-///   1. allocate_units  – Request must be Pending; reserves inventory units
+///   1. allocate_units  – Request must be Pending; reserves inventory units and
+///                        binds the payment to the workflow
 ///   2. confirm_delivery – Workflow must be Allocated; marks units Delivered
 ///   3. settle_payment   – Workflow must be Delivered; releases escrowed payment
 ///
 /// Any step that finds the prerequisite state missing returns an error and makes
 /// no state changes, providing safe rollback semantics within a single transaction.
+///
+/// Two independent circuit breakers guard the workflow:
+///   * `pause()` – blocks every state-mutating entry point.
+///   * `emergency_halt()` – sets a separate flag that blocks the workflow
+///     entry points until `clear_emergency_halt()` is called. `unpause()` never
+///     clears the halt flag and `clear_emergency_halt()` never clears the pause
+///     flag, so an incident can only be acknowledged explicitly.
 mod error;
 mod types;
 
@@ -17,9 +25,12 @@ mod types;
 mod test;
 
 pub use error::CoordinatorError;
+pub use payment_client::DisputeReason;
 pub use types::{DataKey, ExcursionSummary, WorkflowRecord, WorkflowStatus};
 
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, Address, Env, Map, String, Symbol, Vec,
+};
 
 /// Default workflow expiry window: 6 hours expressed in seconds.
 /// After `allocate_units` is called, if `confirm_delivery` is never invoked
@@ -31,7 +42,10 @@ const CONTRACT_VERSION: u32 = 1;
 
 // ── Minimal interface types mirroring the domain contracts ────────────────────
 // These allow the coordinator to inspect cross-contract return values without
-// importing compiled WASMs. The domain contracts must keep these in sync.
+// importing compiled WASMs. Soroban's generated decoder unpacks the returned
+// `ScMap` with `map_unpack_to_linear_memory`, which requires the map to contain
+// *exactly* the declared keys — so every field of the real structs must be
+// mirrored here, in the same order. The domain contracts must keep these in sync.
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,20 +79,60 @@ impl BloodType {
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestStatus {
-    Pending,
-    Approved,
-    Fulfilled,
-    Cancelled,
+pub enum BloodComponent {
+    WholeBlood,
+    RedCells,
+    Plasma,
+    Platelets,
+    Cryoprecipitate,
 }
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Urgency {
+    Critical,
+    Urgent,
+    Routine,
+    Scheduled,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestStatus {
+    Pending,
+    Approved,
+    InProgress,
+    Fulfilled,
+    Cancelled,
+    Rejected,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestHistoryEntry {
+    pub previous_status: RequestStatus,
+    pub is_initial_transition: bool,
+    pub new_status: RequestStatus,
+    pub actor: Address,
+    pub reason: String,
+    pub fulfilled_delta_ml: u32,
+    pub released_reservation: bool,
+    pub timestamp: u64,
+}
+
+/// Mirrors `requests::types::BloodRequest` (14 fields).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BloodRequest {
     pub id: u64,
     /// Recipient blood type; every allocated unit must be able to donate to it.
     pub blood_type: BloodType,
     pub status: RequestStatus,
+    pub assigned_units: Vec<u64>,
+    pub fulfilled_quantity_ml: u32,
+    pub reservation_id: Option<u64>,
+    pub fulfilled_by: Option<Address>,
+    pub history: Vec<RequestHistoryEntry>,
 }
 
 #[contracttype]
@@ -93,12 +147,19 @@ pub enum BloodStatus {
     Disposed,
 }
 
+/// Mirrors `inventory::types::BloodUnit` (9 fields).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct BloodUnit {
     pub id: u64,
-    pub status: BloodStatus,
     pub blood_type: BloodType,
+    pub quantity_ml: u32,
+    pub bank_id: Address,
+    pub donor_id: Option<Address>,
+    pub donation_timestamp: u64,
+    pub expiration_timestamp: u64,
+    pub status: BloodStatus,
+    pub metadata: Map<Symbol, String>,
 }
 
 #[contracttype]
@@ -112,6 +173,7 @@ pub enum PaymentStatus {
     Cancelled,
 }
 
+/// Mirrors `payments::Payment` (12 fields).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct Payment {
@@ -165,7 +227,6 @@ mod inventory_client {
             authorized_by: Address,
             delivery_location: String,
         ) -> BloodUnit;
-        fn get_admin(env: Env) -> Address;
     }
 }
 
@@ -263,6 +324,13 @@ fn get_admin(env: &Env) -> Result<Address, CoordinatorError> {
         .ok_or(CoordinatorError::NotInitialized)
 }
 
+fn require_admin(env: &Env, caller: &Address) -> Result<(), CoordinatorError> {
+    if *caller != get_admin(env)? {
+        return Err(CoordinatorError::Unauthorized);
+    }
+    Ok(())
+}
+
 fn get_contract_address(env: &Env, key: &DataKey) -> Result<Address, CoordinatorError> {
     env.storage()
         .instance()
@@ -272,6 +340,36 @@ fn get_contract_address(env: &Env, key: &DataKey) -> Result<Address, Coordinator
 
 fn is_terminal(status: WorkflowStatus) -> bool {
     matches!(status, WorkflowStatus::Settled | WorkflowStatus::RolledBack)
+}
+
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn is_emergency_halted(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyHalt)
+        .unwrap_or(false)
+}
+
+fn require_not_paused(env: &Env) -> Result<(), CoordinatorError> {
+    if is_paused(env) {
+        return Err(CoordinatorError::ContractPaused);
+    }
+    Ok(())
+}
+
+/// Emergency halt is tracked independently from `Paused`: `unpause()` must never
+/// silently lift a halt, and clearing a halt must never silently unpause.
+fn require_not_emergency_halted(env: &Env) -> Result<(), CoordinatorError> {
+    if is_emergency_halted(env) {
+        return Err(CoordinatorError::EmergencyHalted);
+    }
+    Ok(())
 }
 
 fn load_workflow(env: &Env, request_id: u64) -> Option<WorkflowRecord> {
@@ -431,10 +529,7 @@ impl CoordinatorContract {
 
     /// Returns whether the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        is_paused(&env)
     }
 
     fn require_not_paused(env: &Env) -> Result<(), CoordinatorError> {
@@ -805,6 +900,20 @@ impl CoordinatorContract {
         if payment.status == PaymentStatus::Locked {
             refund_payment(&env, &pay_client, &payment)?;
         }
+        if payment.status == PaymentStatus::Locked {
+            pay_client
+                .try_update_status(
+                    &wf.payment_id,
+                    &PaymentStatus::Refunded,
+                    &env.current_contract_address(),
+                )
+                .map_err(|_| CoordinatorError::PaymentUpdateFailed)?
+                .map_err(|_| CoordinatorError::PaymentUpdateFailed)?;
+        }
+
+        // Return the escrowed payment to the payer before marking the workflow
+        // terminal, so no locked funds are orphaned.
+        refund_locked_payment(&env, &workflow, &admin)?;
 
         wf.status = WorkflowStatus::RolledBack;
         save_workflow(&env, &wf);
