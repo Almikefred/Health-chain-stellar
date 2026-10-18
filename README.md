@@ -126,3 +126,6 @@ For contract deployment, full environment variable reference, and contributor gu
 
 <!-- handsoff-issue-1652 -->
 - #1652: [lifebank] Only the coordinator supports admin transfer; the other nine contracts have a permanently fixed admin key
+
+<!-- handsoff-issue-1653 -->
+- #1653: [lifebank] Six of ten contracts have no upgrade() entrypoint (analytics, coordinator, delivery, identity, matching, reputation)
