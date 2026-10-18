@@ -54,18 +54,23 @@ pub fn allocate_units(
     unit_ids: Vec<u64>,
     payment_id: u64,
     caller: Address,
+    blood_type: BloodType,
 ) -> Result<(), CoordinatorError>
 ```
 
 Step 1 of the workflow.
 
-- Requires `caller` auth.
-- Verifies the request exists and is `Pending`.
-- Verifies each blood unit exists and is `Available`, then marks it `Reserved`.
+- Requires `caller` auth (must be the admin).
+- Verifies the request exists, is `Pending`, and that `blood_type` matches the
+  request's blood type.
+- Verifies the payment exists and is bound to `request_id`.
+- Verifies each blood unit exists and is `Available` and compatible with
+  `blood_type`, then marks it `Reserved`.
 - Creates a `WorkflowRecord` with status `Allocated`.
-- Emits `(coord, alloc, v1)` with `(request_id, unit_count)`.
+- Emits `(coord, alloc, v1)` with `(request_id, unit_ids, unit_count)`.
 
-Fails if the contract is paused or a workflow for this `request_id` already exists in a non-Pending state.
+Fails if the contract is paused or halted, or a workflow for this `request_id`
+already exists in a non-terminal state.
 
 ---
 
@@ -169,7 +174,14 @@ pub fn clear_emergency_halt(env: Env, admin: Address) -> Result<(), CoordinatorE
 pub fn is_emergency_halted(env: Env) -> bool
 ```
 
-Admin-only. Unlike `pause()`, the emergency halt only blocks `confirm_delivery` and `settle_payment` — it does not block new allocations. Designed for active incident containment (e.g. compromised oracle). Emits `(coord, emrghlt, v1)` on activation.
+Admin-only. Unlike `pause()`, the emergency halt is stored in its own
+`DataKey::EmergencyHalt` flag and gates every workflow entry point
+(`allocate_units`, `confirm_delivery`, `settle_payment`, `rollback`,
+`expire_workflow` and the temperature-breach paths) with
+`CoordinatorError::EmergencyHalted`. The two flags are cleared separately:
+`unpause()` never clears the halt, and `clear_emergency_halt()` never clears the
+pause — an incident therefore has to be acknowledged explicitly. Emits
+`(coord, emrghlt, v1)` on activation.
 
 ---
 
@@ -203,6 +215,9 @@ pub struct WorkflowRecord {
     pub status: WorkflowStatus,
     pub delivery_confirmed: bool,
     pub delivery_location: Option<String>,
+    /// `ledger.timestamp() + 6h` at allocation time; `expire_workflow` may be
+    /// called by anyone once this has elapsed.
+    pub expires_at: u64,
 }
 ```
 

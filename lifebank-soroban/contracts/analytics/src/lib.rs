@@ -79,23 +79,13 @@ fn extend_instance_ttl(env: &Env) {
 }
 
 fn require_initialized(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {
-    extend_instance_ttl(env);
-    env.storage()
+    let config = env
+        .storage()
         .instance()
         .get(&DataKey::Config)
         .ok_or(AnalyticsError::NotInitialized)?;
-
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_TTL_MIN, INSTANCE_TTL_MAX);
-
+    extend_instance_ttl(env);
     Ok(config)
-}
-
-fn extend_instance_ttl(env: &Env) {
-    env.storage()
-        .instance()
-        .extend_ttl(INSTANCE_TTL_MIN, INSTANCE_TTL_MAX);
 }
 
 fn require_admin(env: &Env) -> Result<AnalyticsConfig, AnalyticsError> {

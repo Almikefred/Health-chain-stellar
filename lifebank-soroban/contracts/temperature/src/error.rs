@@ -20,4 +20,6 @@ pub enum ContractError {
     OracleNotWhitelisted = 610,
     /// Reading is outside the physically-plausible temperature range
     TemperatureOutOfRange = 611,
+    /// excursion_summary.unit_id does not match the unit_id argument
+    ExcursionSummaryMismatch = 612,
 }

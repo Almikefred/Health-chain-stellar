@@ -81,6 +81,14 @@ pub enum Error {
     RecordNotFound = 36,
     /// Contract has already been initialized.
     AlreadyInitialized = 37,
+    /// Total fees exceed the allowed cap (MAX_FEE_BPS) as a fraction of the
+    /// gross payment amount.  Raised during `create_payment` to close the
+    /// fee-structuring bypass of the multisig high-value threshold (issue #1400).
+    FeesExceedCap = 38,
+    /// `raise_dispute` evidence digest is not a 32-byte SHA-256 hash.
+    InvalidEvidenceDigest = 39,
+    /// A unit ID appears more than once in a caller-supplied batch.
+    DuplicateUnitId = 40,
 }
 
 // Alias for issue/docs terminology.
@@ -694,7 +702,7 @@ impl HealthChainContract {
     /// Initialize the contract with admin
     pub fn initialize(env: Env, admin: Address) -> Result<Symbol, Error> {
         if env.storage().instance().has(&ADMIN) {
-            return Err(Error::RecordNotFound);
+            return Err(Error::AlreadyInitialized);
         }
         admin.require_auth();
         env.storage().instance().set(&ADMIN, &admin);
@@ -1586,7 +1594,12 @@ impl HealthChainContract {
                 },
             );
 
-            return Err(Error::UnitExpired);
+            // Return Ok: on Err Soroban rolls back every write and event in
+            // this invocation, so the Expired status, the Recovered custody
+            // record and the recovery event above would never persist and
+            // the unit would stay InTransit forever. The outcome is reported
+            // through the `custody/recover` event and the unit's status.
+            return Ok(());
         }
 
         // Update custody event status
@@ -1878,7 +1891,14 @@ impl HealthChainContract {
 
         let old_status = unit.status;
 
-        if old_status == BloodStatus::Quarantined {
+        // Only stock still in the supply chain can be quarantined. Delivered,
+        // Discarded and Expired units are terminal; quarantining them would
+        // re-open them and let finalize_quarantine(Release) return them to
+        // Available.
+        if !matches!(
+            old_status,
+            BloodStatus::Available | BloodStatus::Reserved | BloodStatus::InTransit
+        ) {
             return Err(Error::InvalidStatus);
         }
 
@@ -3845,9 +3865,13 @@ impl HealthChainContract {
             return Err(Error::Unauthorized);
         }
 
-        // Can only cancel if Pending, Approved, or InProgress
-        if request.status == RequestStatus::Fulfilled || request.status == RequestStatus::Cancelled
-        {
+        // Can only cancel if Pending, Approved, or InProgress. Rejected,
+        // Disputed and Resolved are not cancellable: cancelling a Disputed
+        // request would bypass dispute resolution, and the others are final.
+        if !matches!(
+            request.status,
+            RequestStatus::Pending | RequestStatus::Approved | RequestStatus::InProgress
+        ) {
             return Err(Error::InvalidStatus);
         }
 
@@ -9914,6 +9938,109 @@ mod test {
         assert_eq!(request.status, RequestStatus::Approved);
         assert_eq!(request.fulfilled_quantity_ml, 0);
         assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Reserved);
+    }
+
+    /// #1441: a unit that expires in transit must actually be recorded as
+    /// Expired/Recovered. Returning Err rolled the recovery back and left the
+    /// unit stuck InTransit.
+    #[test]
+    fn test_confirm_transfer_persists_recovery_when_unit_expired_in_transit() {
+        let env = Env::default();
+        let (_, _, hospital, client) = setup_contract_with_hospital(&env);
+        let bank = Address::generate(&env);
+        env.mock_all_auths();
+        client.register_blood_bank(&bank);
+
+        // Registered a day before the transfer (the minimum shelf life), so it
+        // expires 10 minutes into the 30-minute transfer window.
+        let initiated_at = 1_000_000u64;
+        env.ledger().set_timestamp(initiated_at + 600 - 86_400);
+        let unit_id = client.register_blood(
+            &bank,
+            &BloodType::OPositive,
+            &BloodComponent::WholeBlood,
+            &450,
+            &(initiated_at + 600),
+            &None,
+        );
+        client.allocate_blood(&bank, &unit_id, &hospital);
+        env.ledger().set_timestamp(initiated_at);
+        let event_id = client.initiate_transfer(&bank, &unit_id);
+
+        // Inside the 30-minute window, but after the unit's own expiry.
+        env.ledger().set_timestamp(initiated_at + 900);
+        client.confirm_transfer(&hospital, &event_id);
+
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Expired);
+        assert_eq!(
+            client.get_custody_event(&event_id).status,
+            CustodyStatus::Recovered
+        );
+        // The transfer is closed; it cannot be confirmed a second time.
+        assert_eq!(
+            client.try_confirm_transfer(&hospital, &event_id),
+            Err(Ok(Error::InvalidStatus))
+        );
+    }
+
+    /// #1442: terminal units cannot be quarantined (and so cannot be released
+    /// back to Available through finalize_quarantine).
+    #[test]
+    fn test_quarantine_rejects_terminal_units() {
+        let env = Env::default();
+        let (_contract_id, bank, _hospital, client, unit_id) = setup_bank_and_allocated_unit(&env);
+
+        client.withdraw_blood(&bank, &unit_id, &WithdrawalReason::Contaminated);
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Discarded);
+
+        assert_eq!(
+            client.try_quarantine_blood(&bank, &unit_id, &QuarantineReason::ScreeningFailure),
+            Err(Ok(Error::InvalidStatus))
+        );
+        assert_eq!(client.get_blood_status(&unit_id), BloodStatus::Discarded);
+    }
+
+    /// #1444: only Pending/Approved/InProgress requests are cancellable.
+    #[test]
+    fn test_cancel_request_rejects_non_cancellable_states() {
+        let env = Env::default();
+        let (contract_id, _, hospital, client) = setup_contract_with_hospital(&env);
+        env.mock_all_auths();
+        let current_time = env.ledger().timestamp();
+        let request_id = client.create_request(
+            &hospital,
+            &BloodType::APositive,
+            &500,
+            &UrgencyLevel::Urgent,
+            &(current_time + 3600),
+            &String::from_str(&env, "Ward D"),
+        );
+
+        for status in [
+            RequestStatus::Rejected,
+            RequestStatus::Disputed,
+            RequestStatus::Resolved,
+        ] {
+            env.as_contract(&contract_id, || {
+                let mut request: BloodRequest = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Request(request_id))
+                    .unwrap();
+                request.status = status;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Request(request_id), &request);
+            });
+            assert_eq!(
+                client.try_cancel_request(
+                    &hospital,
+                    &request_id,
+                    &String::from_str(&env, "no longer needed")
+                ),
+                Err(Ok(Error::InvalidStatus))
+            );
+        }
     }
 
     #[test]
