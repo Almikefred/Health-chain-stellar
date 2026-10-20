@@ -34,12 +34,16 @@ import { WorkingHoursDto } from './dto/working-hours.dto';
 import { RiderEntity } from './entities/rider.entity';
 import { RiderStatus } from './enums/rider-status.enum';
 import { RidersService } from './riders.service';
+import { RiderSearchService } from './services/rider-search.service';
 
 @ApiTags('Riders')
 @ApiBearerAuth()
 @Controller('riders')
 export class RidersController {
-  constructor(private readonly ridersService: RidersService) {}
+  constructor(
+    private readonly ridersService: RidersService,
+    private readonly riderSearchService: RiderSearchService,
+  ) {}
 
   @RequirePermissions(Permission.VIEW_RIDERS)
   @ApiOperation({ summary: 'List riders' })
@@ -122,7 +126,7 @@ export class RidersController {
     )
     query: PaginationQueryDto,
   ) {
-    return this.ridersService.search(query);
+    return this.riderSearchService.searchRiders(query);
   }
 
   @RequirePermissions(Permission.VIEW_RIDERS)
@@ -254,7 +258,7 @@ export class RidersController {
   }
 
   private async assertRiderAccess(
-    id: string,
+    riderId: string,
     user: { id: string; permissions?: Permission[] },
   ): Promise<void> {
     const rider = await this.ridersService.findOne(id);
