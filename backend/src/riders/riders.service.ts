@@ -261,6 +261,45 @@ export class RidersService {
   }
 
   /**
+   * Aggregated rider statistics for the admin dashboard.
+   */
+  async getStatistics(): Promise<{
+    message: string;
+    data: {
+      total: number;
+      byStatus: Record<string, number>;
+      verified: number;
+      available: number;
+    };
+  }> {
+    const riders = await this.riderRepository.find();
+
+    const byStatus: Record<string, number> = {};
+    let verified = 0;
+    let available = 0;
+
+    for (const rider of riders) {
+      byStatus[rider.status] = (byStatus[rider.status] ?? 0) + 1;
+      if (rider.isVerified) {
+        verified += 1;
+      }
+      if (rider.status === RiderStatus.AVAILABLE) {
+        available += 1;
+      }
+    }
+
+    return {
+      message: 'Rider statistics retrieved successfully',
+      data: {
+        total: riders.length,
+        byStatus,
+        verified,
+        available,
+      },
+    };
+  }
+
+  /**
    * Counts in-flight dispatches per rider so dispatch scoring reflects
    * current workload rather than lifetime completed deliveries.
    */
@@ -275,40 +314,6 @@ export class RidersService {
     const rows = await this.riderRepository.manager
       .createQueryBuilder()
       .select('dispatch.rider_id', 'riderId')
-      .addSelect('COUNT(*)', 'count')
-      .from('dispatches', 'dispatch')
-      .where('dispatch.rider_id IN (:...riderIds)', { riderIds })
-      .andWhere('dispatch.status IN (:...activeStatuses)', {
-        activeStatuses: ACTIVE_DISPATCH_STATUSES,
-      })
-      .groupBy('dispatch.rider_id')
-      .getRawMany<{ riderId: string; count: string }>();
+      .addSelec
 
-    for (const row of rows) {
-      counts.set(row.riderId, Number(row.count));
-    }
-    return counts;
-  }
-
-  async queryAvailability(dto: AvailabilityQueryDto) {
-    const qb = this.riderRepository
-      .createQueryBuilder('rider')
-      .where('rider.status = :status', { status: RiderStatus.AVAILABLE })
-      .andWhere('rider.is_verified = true');
-
-    if (dto.area) {
-      qb.andWhere('rider.preferred_areas::text ILIKE :area', {
-        area: `%${dto.area}%`,
-      });
-    }
-
-    if (
-      dto.latitude !== undefined &&
-      dto.longitude !== undefined &&
-      dto.radiusKm !== undefined
-    ) {
-      qb
-        .andWhere('rider.latitude IS NOT NULL')
-        .andWhere('rider.longitude IS NOT NULL')
-
-/* … truncated 105 chars — edit only what you need near the top … */
+/* … truncated 1127 chars — edit only what you need near the top … */
